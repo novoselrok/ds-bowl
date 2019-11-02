@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import gc
 
 
 def get_default_accuracy_groups_dict():
@@ -37,9 +38,10 @@ def compute_accuracy_group(row):
     return 0
 
 
-def compute_features(df_data, df_assessments):
+def compute_features(df_data, df_assessments, event_codes):
     game_sessions = []
 
+    event_codes = ['cnt_event_code_' + str(column) for column in event_codes]
     df_assessments = df_assessments.sort_values(by='installation_id')
     total_assessments = df_assessments.shape[0]
 
@@ -54,6 +56,10 @@ def compute_features(df_data, df_assessments):
 
         previous_events: pd.DataFrame = events_for_installation_id[
             events_for_installation_id['timestamp'] < start_timestamp]
+
+        present_event_codes = ['cnt_event_code_' + str(column)
+                               for column in list(previous_events['event_code'].unique())]
+        previous_events = pd.get_dummies(previous_events, columns=['event_code'], prefix='cnt_event_code')
 
         assessment_type = title_to_type_and_world['type'][assessment['title']]
         assessment_world = title_to_type_and_world['world'][assessment['title']]
@@ -75,6 +81,7 @@ def compute_features(df_data, df_assessments):
                     'assessment_title': assessment['title'],
                     'assessment_type': assessment_type,
                     'assessment_world': assessment_world,
+                    **{column: 0 for column in event_codes}
                 }, index=[0])
             )
             continue
@@ -84,17 +91,17 @@ def compute_features(df_data, df_assessments):
         # - Compute accuracy groups and sum them for all game sessions
         # - Count previous different titles, worlds and types
         # - use current assessment title, world and type as categorical variable
-        # - add start_timestamp for later sorting and use as a feature (dayofweek, etc)
+        # TODO: add start_timestamp for later sorting and use as a feature (dayofweek, etc)
         # TODO: Figure out how to add event_code
         # TODO: Time from previous assessment
         # TODO: Index of the current assessment (user might do worse on first assessment than on later assessments)
 
         aggregated_game_sessions = previous_events[
             ['game_session', 'game_time', 'event_count', 'is_correct_attempt', 'is_uncorrect_attempt', 'title', 'type',
-             'world']
+             'world', *present_event_codes]
         ].groupby('game_session').agg(
             {'game_time': 'max', 'event_count': 'max', 'is_correct_attempt': 'sum', 'is_uncorrect_attempt': 'sum',
-             'title': 'first', 'type': 'first', 'world': 'first'}
+             'title': 'first', 'type': 'first', 'world': 'first', **{column: 'sum' for column in present_event_codes}}
         ).reset_index()
 
         aggregated_game_sessions['accuracy_group'] = aggregated_game_sessions \
@@ -114,6 +121,10 @@ def compute_features(df_data, df_assessments):
             'is_correct_attempt': 'correct_attempts',
             'is_uncorrect_attempt': 'uncorrect_attempts',
         }, axis=1, inplace=True)
+
+        # Add missing event_codes
+        for missing_event_code in (set(event_codes) - set(present_event_codes)):
+            aggregated_game_sessions[missing_event_code] = 0
 
         game_sessions.append(aggregated_game_sessions)
 
@@ -135,7 +146,7 @@ def compute_features(df_data, df_assessments):
         'assessment_title': 'first',
         'assessment_type': 'first',
         'assessment_world': 'first',
-        # Sum dummy columns (cnt_train_*, cnt_type_*, cnt_world_*)
+        # Sum dummy columns (cnt_train_*, cnt_type_*, cnt_world_*, cnt_event_code_*)
         **{column: 'sum' for column in df_final.columns if column.startswith('cnt')}
     }
 
@@ -173,11 +184,9 @@ def compute_features(df_data, df_assessments):
 
 df_train_labels = pd.read_csv('data/train_labels.csv')
 df_train = pd.read_csv('preprocessed-data/train.csv')
-df_test = pd.read_csv('preprocessed-data/test.csv')
+event_codes = list(pd.read_csv('preprocessed-data/event_codes.csv')['event_code'])
 
-# Convert timestamps
 df_train['timestamp'] = (pd.to_datetime(df_train['timestamp']).astype(int) / 10 ** 9).astype(int)
-df_test['timestamp'] = (pd.to_datetime(df_test['timestamp']).astype(int) / 10 ** 9).astype(int)
 
 print('Preparing train data...')
 # Add game session start timestamp to train labels
@@ -188,19 +197,22 @@ game_session_start_timestamps = df_train.groupby(
 df_train_labels = df_train_labels.merge(
     game_session_start_timestamps, on=['installation_id', 'game_session'], how='left'
 )
-train_data = compute_features(df_train, df_train_labels)
-
-print('Preparing test data...')
-test_assessments_to_predict = df_test.groupby(['installation_id']).last().reset_index()
-test_data = compute_features(df_test, test_assessments_to_predict)
-
-train_columns = set(train_data.columns.tolist())
-test_columns = set(test_data.columns.tolist())
-if train_columns != test_columns:
-    print('Mismatch between train and test columns, fixing...')
-    train_data = train_data.drop(columns=list(train_columns - test_columns))
-    test_data = test_data.drop(columns=list(test_columns - train_columns))
-
+train_data = compute_features(df_train, df_train_labels, event_codes)
 print('Writing files...')
 train_data.to_csv('preprocessed-data/train_features.csv', index=False)
+del df_train
+del train_data
+gc.collect()
+
+print('Preparing test data...')
+df_test = pd.read_csv('preprocessed-data/test.csv')
+df_test['timestamp'] = (pd.to_datetime(df_test['timestamp']).astype(int) / 10 ** 9).astype(int)
+test_assessments_to_predict = df_test.groupby(['installation_id']).last().reset_index()
+test_data = compute_features(df_test, test_assessments_to_predict, event_codes)
+
+print('Writing files...')
 test_data.to_csv('preprocessed-data/test_features.csv', index=False)
+
+del df_test
+del test_data
+gc.collect()

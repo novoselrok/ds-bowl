@@ -40,19 +40,12 @@ template = """<html>
 #
 # df_specs = df_specs.groupby('info')
 
-args_to_extract = {'duration', 'total_duration', 'dwell_time', 'misses'}
-event_ids_to_props = {}
 rows = []
 for _, spec in df_specs.iterrows():
     event_id = spec['event_id']
     info = spec['info']
     args_json = json.loads(spec['args'])
     args_names = set([arg['name'] for arg in args_json])
-
-    present_args = args_to_extract & args_names
-    print(present_args)
-    if len(present_args) > 0:
-        event_ids_to_props[event_id] = list(present_args)
 
     skip = ['game_time', 'event_count', 'event_code']
     args_html = ''.join([
@@ -70,9 +63,6 @@ for _, spec in df_specs.iterrows():
             </td>
         </tr>
     """)
-
-with open('event_props.json', 'w', encoding='utf-8') as f:
-    json.dump(event_ids_to_props, f)
 
 
 with open('specs.html', 'w', encoding='utf-8') as f:

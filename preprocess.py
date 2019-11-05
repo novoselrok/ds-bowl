@@ -2,34 +2,55 @@ import json
 import os
 
 import pandas as pd
+import numpy as np
 
 with open('event_props.json', encoding='utf-8') as f:
     event_ids_to_props = json.load(f)
 
 
 def extract_props_from_event_data(df_events):
-    extracted_props = []
-    for idx, event in df_events.iterrows():
-        event_id = event['event_id']
-        event_data = json.loads(event['event_data'])
-
-        if event_id not in event_ids_to_props:
-            extracted_props.append({})
+    event_data_props_columns = []
+    for event_id, props in event_ids_to_props.items():
+        if len(props) == 0:
             continue
 
-        props = event_ids_to_props[event_id]
-        values = {f'event_data_prop_{event_id}_{prop}': event_data[prop] for prop in props}
-        extracted_props.append(values)
+        for prop in props:
+            event_data_props_columns.append(f'event_data_prop_{event_id}_{prop}')
 
-        if idx % 10000 == 0:
-            print(f'Row {idx + 1}/{df_events.shape[0]} done')
+    df_events_per_game_session = df_events.groupby('game_session')
+    game_sessions_len = len(df_events_per_game_session)
 
-    df_event_data_props = pd.SparseDataFrame(extracted_props)
-    df_event_data_props.fillna(0, inplace=True)
-    return df_event_data_props
+    columns = {column: np.zeros((game_sessions_len,)) for column in event_data_props_columns}
+    columns['game_session'] = np.empty((game_sessions_len,), dtype=object)
+
+    group_idx = 0
+    for idx, event_group in df_events_per_game_session:
+        aggregated_game_session = {column: 0.0 for column in event_data_props_columns}
+        aggregated_game_session['game_session'] = event_group.iloc[0]['game_session']
+
+        for _, event in event_group.iterrows():
+            event_id = event['event_id']
+            event_data = json.loads(event['event_data'])
+
+            if event_id not in event_ids_to_props:
+                continue
+
+            props = event_ids_to_props[event_id]
+            for prop in props:
+                aggregated_game_session[f'event_data_prop_{event_id}_{prop}'] += event_data[prop]
+
+        for key, value in aggregated_game_session.items():
+            columns[key][group_idx] = value
+
+        if group_idx % 1000 == 0:
+            print(f'Done group {group_idx}/{game_sessions_len}')
+
+        group_idx += 1
+
+    return pd.DataFrame(columns)
 
 
-def preprocess_data(df_data, output_path):
+def preprocess_data(df_data, output_path, event_data_props_per_game_session_path):
     is_assessment = df_data['type'] == 'Assessment'
 
     is_bird_measurer_attempt = (df_data['title'] == 'Bird Measurer (Assessment)') & (df_data['event_code'] == 4110)
@@ -42,10 +63,10 @@ def preprocess_data(df_data, output_path):
     df_data['is_correct_attempt'] = (is_assessment_attempt & is_correct_attempt).astype(int)
     df_data['is_uncorrect_attempt'] = (is_assessment_attempt & is_uncorrect_attempt).astype(int)
 
-    # df_event_data_props = extract_props_from_event_data(df_data[['event_id', 'event_data']])
+    extract_props_from_event_data(df_data[['game_session', 'event_id', 'event_data']]) \
+        .to_csv(event_data_props_per_game_session_path, index=False)
 
     df_data = df_data.drop(columns=['event_data'])
-    # df_data = df_data.merge(df_event_data_props, left_index=True, right_index=True)
     df_data.to_csv(output_path, index=False)
 
 
@@ -63,6 +84,11 @@ event_codes = set(df_train['event_code'].unique()) & set(df_test['event_code'].u
 pd.DataFrame({'event_code': list(event_codes)}).to_csv('preprocessed-data/event_codes.csv', index=False)
 
 print('Preprocessing train...')
-preprocess_data(df_train, 'preprocessed-data/train.csv')
+preprocess_data(
+    df_train,
+    'preprocessed-data/train.csv',
+    'preprocessed-data/train_event_data_props_per_game_session.csv'
+)
+
 print('Preprocessing test...')
-preprocess_data(df_test, 'preprocessed-data/test.csv')
+preprocess_data(df_test, 'preprocessed-data/test.csv', 'preprocessed-data/test_event_data_props_per_game_session.csv')

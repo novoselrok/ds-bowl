@@ -1,67 +1,84 @@
+import time
 import pandas as pd
 import numpy as np
 import lightgbm as lgb
+from bayes_opt import BayesianOptimization
 from lightgbm import LGBMClassifier
 from sklearn.metrics import cohen_kappa_score, make_scorer
-
-from scipy.stats import randint as sp_randint
-from scipy.stats import uniform as sp_uniform
-
-from sklearn.model_selection import KFold, StratifiedKFold, RandomizedSearchCV, train_test_split, GroupKFold
+from sklearn.model_selection import GroupKFold
 from sklearn.preprocessing import LabelEncoder
-
 import matplotlib.pyplot as plt
 
+categorical_features = [
+    'assessment_title',
+    'assessment_world',
+]
 
-def search_best_model(X, y_target, feature_names):
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y_target,
-        test_size=0.20, random_state=2019, stratify=y_target
-    )
-    kf = StratifiedKFold(n_splits=5, random_state=2019)
-    params = {
-        'learning_rate': [0.1, 0.01, 0.05, 0.001, 0.005],
-        'max_depth': sp_randint(3, 12),
-        'num_leaves': sp_randint(6, 50),
-        'min_child_samples': sp_randint(100, 500),
-        'min_child_weight': [1e-5, 1e-3, 1e-2, 1e-1, 1, 1e1, 1e2, 1e3, 1e4],
-        'subsample': sp_uniform(loc=0.2, scale=0.8),
-        'colsample_bytree': sp_uniform(loc=0.2, scale=0.8),
-        'reg_alpha': [0, 1e-1, 1, 2, 5, 7, 10, 50, 100],
-        'reg_lambda': [0, 1e-1, 1, 5, 10, 20, 50, 100]
-    }
+columns_to_drop = [
+    'installation_id',
+    'assessment_game_session',
+    # 'assessment_start_timestamp',
+]
 
-    clf = LGBMClassifier(
-        n_estimators=5000,
-        objective='multiclass',
-        metric='multi_error',
-        random_state=2019,
-        num_classes=4,
-        silent=True,
-        n_jobs=8
-    )
 
-    rscv = RandomizedSearchCV(
-        estimator=clf,
-        param_distributions=params,
-        cv=kf,
-        n_iter=500,
-        verbose=6,
-        scoring=make_scorer(cohen_kappa_score, weights='quadratic'),
-        n_jobs=2
-    )
+def bayes_lgb(X, y_target, train_installation_ids, feature_names):
+    def lgb_eval(**params):
+        for param in cast_to_int:
+            if param in params:
+                params[param] = int(params[param])
 
-    rscv.fit(
-        X_train, y_train,
-        early_stopping_rounds=500,
-        eval_set=[(X_test, y_test)],
-        verbose=-1,
-        feature_name=feature_names,
-        categorical_feature=categorical_features
-    )
+        kf = GroupKFold(n_splits=params['n_splits'])
+        del params['n_splits']
 
-    print(rscv.best_params_)
-    print(rscv.best_score_)
+        scores = []
+        for fold, (train_split, test_split) in enumerate(kf.split(X, y_target, train_installation_ids)):
+            x_train, x_val, y_train, y_val = X[train_split], X[test_split], y_target[train_split], y_target[test_split]
+
+            model = LGBMClassifier(
+                random_state=2019,
+                n_estimators=5000,
+                num_classes=4,
+                objective='multiclass',
+                metric='multi_logloss',
+                n_jobs=-1,
+                **params
+            )
+
+            model.fit(
+                x_train, y_train,
+                early_stopping_rounds=500,
+                eval_set=[(x_train, y_train), (x_val, y_val)],
+                verbose=0,
+                feature_name=feature_names,
+                categorical_feature=categorical_features
+            )
+
+            # Diagnostic
+            pred = model.predict_proba(x_val).argmax(axis=1)
+            score = cohen_kappa_score(y_val, pred, weights='quadratic')
+            scores.append(score)
+
+        return np.mean(scores)
+
+    cast_to_int = ['max_depth', 'num_leaves', 'min_child_samples', 'n_splits']
+
+    lgb_bo = BayesianOptimization(lgb_eval, {
+        'n_splits': (8, 11),
+        'learning_rate': (0.005, 0.1),
+        'max_depth': (5, 10),
+        'num_leaves': (20, 700),
+        'min_child_samples': (50, 500),
+        'min_child_weight': (1e-5, 1e4),
+        'subsample': (0.1, 1.0),
+        'colsample_bytree': (0.1, 1.0),
+        'reg_alpha': (0, 10),
+        'reg_lambda': (0, 10)
+    })
+
+    lgb_bo.maximize(n_iter=200, init_points=60)
+    print(lgb_bo.max)
+    with open('tmp.json', 'w', encoding='utf-8') as f:
+        f.write(str(lgb_bo.max))
 
 
 def fit_model_and_output_submission(X, X_test, y_target, train_installation_ids, test_installation_ids, feature_names):
@@ -83,14 +100,24 @@ def fit_model_and_output_submission(X, X_test, y_target, train_installation_ids,
         best_params_3 = {'colsample_bytree': 0.20814718702813428, 'learning_rate': 0.05, 'max_depth': 11,
                          'min_child_samples': 103, 'min_child_weight': 10.0, 'num_leaves': 33, 'reg_alpha': 7,
                          'reg_lambda': 5, 'subsample': 0.3409567257294305}
-
+        best_params_4 = {'colsample_bytree': 0.5971164870817448, 'learning_rate': 0.0777901292547735,
+                         'max_depth': 3, 'min_child_samples': 66,
+                         'min_child_weight': 715.5457196501912,
+                         'num_leaves': 18, 'reg_alpha': 0.24033071667305395,
+                         'reg_lambda': 65.40955854278762, 'subsample': 0.31442139140586617}
+        best_params_5 = {'colsample_bytree': 0.3909905519188057, 'learning_rate': 0.01,
+                         'max_depth': 14, 'min_child_samples': 494,
+                         'min_child_weight': 644.1218422907667,
+                         'num_leaves': 7, 'reg_alpha': 2.8507673240668163,
+                         'reg_lambda': 1.8450857631793993, 'subsample': 0.13477625349661213}
         model = LGBMClassifier(
+            random_state=2019,
             n_estimators=100000,
             num_classes=4,
             objective='multiclass',
             metric='multi_error',
             n_jobs=-1,
-            **best_params_3
+            **best_params_5
         )
 
         model.fit(
@@ -101,6 +128,9 @@ def fit_model_and_output_submission(X, X_test, y_target, train_installation_ids,
             feature_name=feature_names,
             categorical_feature=categorical_features
         )
+
+        # lgb.plot_importance(model, figsize=(12, 60), max_num_features=20)
+        # plt.show()
 
         y_test += model.predict_proba(X_test) / n_splits
 
@@ -119,23 +149,47 @@ def fit_model_and_output_submission(X, X_test, y_target, train_installation_ids,
     }).to_csv('submission.csv', index=False)
 
 
-categorical_features = [
-    'assessment_title',
-    'assessment_type',
-    'assessment_world',
-]
+def get_feature_importances(X, y_target, train_installation_ids, feature_names):
+    n_splits = 10
+    kf = GroupKFold(n_splits=n_splits)
 
-columns_to_drop = [
-    'installation_id',
-    'assessment_game_session',
-    'assessment_start_timestamp',
-]
+    feature_importances = np.zeros(X.shape[1])
+    for fold, (train_split, test_split) in enumerate(kf.split(X, y_target, train_installation_ids)):
+        x_train, x_val, y_train, y_val = X[train_split], X[test_split], y_target[train_split], y_target[test_split]
+        model = LGBMClassifier(
+            random_state=2019,
+            n_estimators=100000,
+            num_classes=4,
+            objective='multiclass',
+            metric='multi_error',
+            n_jobs=-1,
+        )
+
+        model.fit(
+            x_train, y_train,
+            early_stopping_rounds=500,
+            eval_set=[(x_train, y_train), (x_val, y_val)],
+            verbose=100,
+            feature_name=feature_names,
+            categorical_feature=categorical_features
+        )
+        feature_importances += model.feature_importances_ / n_splits
+
+    feature_importances = pd.DataFrame({'feature': feature_names,
+                                        'importance': feature_importances}).sort_values('importance',
+                                                                                        ascending=False)
+    feature_importances.to_csv('feature_importances.csv', index=False)
 
 
 def main():
+    feature_importances = pd.read_csv('feature_importances.csv')
+    non_zero_features = set(feature_importances[feature_importances['importance'] != 0.0]['feature'])
     df_train_features = pd.read_csv('preprocessed-data/train_features.csv')
+    used_columns = ['installation_id', 'assessment_game_session'] + list(
+        set(df_train_features.columns.tolist()) & non_zero_features)
+    df_train_features = df_train_features[used_columns]
     # Make sure test columns are in the correct order
-    df_test_features = pd.read_csv('preprocessed-data/test_features.csv')[df_train_features.columns.tolist()]
+    df_test_features = pd.read_csv('preprocessed-data/test_features.csv')[used_columns]
 
     df_train_labels = pd.read_csv(
         'data/train_labels.csv',
@@ -168,7 +222,8 @@ def main():
     X_test = df_test_features.values
 
     fit_model_and_output_submission(X, X_test, y_target, train_installation_ids, test_installation_ids, feature_names)
-    # search_best_model(X, y_target, feature_names)
+    # bayes_lgb(X, y_target, train_installation_ids, feature_names)
+    # get_feature_importances(X, y_target, train_installation_ids, feature_names)
 
 
 if __name__ == '__main__':

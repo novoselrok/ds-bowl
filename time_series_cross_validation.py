@@ -1,4 +1,5 @@
 import time
+import json
 import pandas as pd
 import numpy as np
 import lightgbm as lgb
@@ -65,10 +66,10 @@ def bayes_lgb(X, y_target, train_installation_ids, feature_names):
     lgb_bo = BayesianOptimization(lgb_eval, {
         'n_splits': (8, 11),
         'learning_rate': (0.005, 0.1),
-        'max_depth': (5, 10),
-        'num_leaves': (20, 700),
-        'min_child_samples': (50, 500),
-        'min_child_weight': (1e-5, 1e4),
+        'max_depth': (3, 10),
+        'num_leaves': (5, 700),
+        'min_child_samples': (50, 1000),
+        'min_child_weight': (0.0001, 1000),
         'subsample': (0.1, 1.0),
         'colsample_bytree': (0.1, 1.0),
         'reg_alpha': (0, 10),
@@ -115,9 +116,15 @@ def fit_model_and_output_submission(X, X_test, y_target, train_installation_ids,
             n_estimators=100000,
             num_classes=4,
             objective='multiclass',
-            metric='multi_error',
+            metric='multi_logloss',
             n_jobs=-1,
-            **best_params_5
+            learning_rate=0.01,
+            colsample_bytree=0.5,
+            subsample=0.5,
+            max_depth=3,
+            num_leaves=5,
+            min_child_samples=2000,
+            reg_lambda=1
         )
 
         model.fit(
@@ -128,9 +135,6 @@ def fit_model_and_output_submission(X, X_test, y_target, train_installation_ids,
             feature_name=feature_names,
             categorical_feature=categorical_features
         )
-
-        # lgb.plot_importance(model, figsize=(12, 60), max_num_features=20)
-        # plt.show()
 
         y_test += model.predict_proba(X_test) / n_splits
 
@@ -181,12 +185,35 @@ def get_feature_importances(X, y_target, train_installation_ids, feature_names):
     feature_importances.to_csv('feature_importances.csv', index=False)
 
 
+def get_correlated_features(df_train_features):
+    df_train_features = df_train_features[list(set(df_train_features.columns) - set(categorical_features))]
+
+    # Threshold for removing correlated variables
+    threshold = 0.9
+
+    # Absolute value correlation matrix
+    corr_matrix = df_train_features.corr().abs()
+
+    # Upper triangle of correlations
+    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(np.bool))
+
+    # Select columns with correlations above threshold
+    to_drop = [column for column in upper.columns if any(upper[column] > threshold)]
+
+    with open('correlated_features.json', 'w', encoding='utf-8') as f:
+        json.dump({'features': to_drop}, f)
+
+
 def main():
     feature_importances = pd.read_csv('feature_importances.csv')
-    non_zero_features = set(feature_importances[feature_importances['importance'] != 0.0]['feature'])
+    non_important_features = set(feature_importances[feature_importances['importance'] == 0.0]['feature'])
+    with open('correlated_features.json', encoding='utf-8') as f:
+        correlated_features_to_drop = json.load(f)['features']
+
     df_train_features = pd.read_csv('preprocessed-data/train_features.csv')
-    used_columns = ['installation_id', 'assessment_game_session'] + list(
-        set(df_train_features.columns.tolist()) & non_zero_features)
+    used_columns = list(
+        (set(df_train_features.columns.tolist()) - non_important_features) - set(correlated_features_to_drop)
+    )
     df_train_features = df_train_features[used_columns]
     # Make sure test columns are in the correct order
     df_test_features = pd.read_csv('preprocessed-data/test_features.csv')[used_columns]
@@ -221,9 +248,10 @@ def main():
     X = df_train_features.values
     X_test = df_test_features.values
 
-    fit_model_and_output_submission(X, X_test, y_target, train_installation_ids, test_installation_ids, feature_names)
-    # bayes_lgb(X, y_target, train_installation_ids, feature_names)
+    # fit_model_and_output_submission(X, X_test, y_target, train_installation_ids, test_installation_ids, feature_names)
+    bayes_lgb(X, y_target, train_installation_ids, feature_names)
     # get_feature_importances(X, y_target, train_installation_ids, feature_names)
+    # get_correlated_features(df_train_features)
 
 
 if __name__ == '__main__':

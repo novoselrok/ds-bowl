@@ -192,5 +192,18 @@ if __name__ == '__main__':
             'reg_alpha': (0, 10),
             'reg_lambda': (0, 10)
         },
-        probes=[]
+        probes=[
+            {
+                'n_splits': 8,
+                'colsample_bytree': 0.5551535508116036,
+                'learning_rate': 0.01859880300849997,
+                'max_depth': 6,
+                'min_child_samples': 55,
+                'min_child_weight': 27.418512657045937,
+                'num_leaves': 6,
+                'reg_alpha': 7.554123013819799,
+                'reg_lambda': 4.4094812663177265,
+                'subsample': 0.9493215701448805
+            }
+        ]
     )

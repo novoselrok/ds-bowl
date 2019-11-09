@@ -66,7 +66,7 @@ def bayes_lgb(X, y_target, train_installation_ids, feature_names):
     lgb_bo = BayesianOptimization(lgb_eval, {
         'n_splits': (8, 11),
         'learning_rate': (0.005, 0.1),
-        'max_depth': (3, 10),
+        'max_depth': (3, 15),
         'num_leaves': (5, 700),
         'min_child_samples': (50, 1000),
         'min_child_weight': (0.0001, 1000),
@@ -76,7 +76,7 @@ def bayes_lgb(X, y_target, train_installation_ids, feature_names):
         'reg_lambda': (0, 10)
     })
 
-    lgb_bo.maximize(n_iter=200, init_points=60)
+    lgb_bo.maximize(n_iter=100, init_points=30)
     print(lgb_bo.max)
     with open('tmp.json', 'w', encoding='utf-8') as f:
         f.write(str(lgb_bo.max))

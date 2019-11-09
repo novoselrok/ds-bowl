@@ -40,7 +40,7 @@ def lgb_eval(**params):
         pred = model.predict_proba(x_val).argmax(axis=1)
         return cohen_kappa_score(y_val, pred, weights='quadratic')
 
-    for param in ['max_depth', 'num_leaves', 'min_child_samples', 'n_splits']:
+    for param in ['max_depth', 'max_bin', 'num_leaves', 'min_child_samples', 'n_splits', 'subsample_freq']:
         if param in params:
             params[param] = int(params[param])
 
@@ -184,26 +184,14 @@ if __name__ == '__main__':
             'n_splits': (5, 11),
             'learning_rate': (0.01, 0.1),
             'max_depth': (3, 8),
+            'max_bin': (2, 255),
             'num_leaves': (5, 60),
             'min_child_samples': (50, 1000),
             'min_child_weight': (0.1, 1000),
             'subsample': (0.1, 1.0),
+            'subsample_freq': (1, 10),
             'colsample_bytree': (0.1, 1.0),
             'reg_alpha': (0, 10),
             'reg_lambda': (0, 10)
-        },
-        probes=[
-            {
-                'n_splits': 8,
-                'colsample_bytree': 0.5551535508116036,
-                'learning_rate': 0.01859880300849997,
-                'max_depth': 6,
-                'min_child_samples': 55,
-                'min_child_weight': 27.418512657045937,
-                'num_leaves': 6,
-                'reg_alpha': 7.554123013819799,
-                'reg_lambda': 4.4094812663177265,
-                'subsample': 0.9493215701448805
-            }
-        ]
+        }
     )

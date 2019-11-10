@@ -2,13 +2,13 @@ import csv
 import json
 import os
 import gc
-from collections import defaultdict
+import random
+from collections import defaultdict, Counter
 
 import pandas as pd
 import numpy as np
 from lightgbm import LGBMClassifier
 from sklearn.metrics import cohen_kappa_score
-from sklearn.model_selection import GroupKFold
 from sklearn.preprocessing import LabelEncoder
 
 BIRD_MEASURER_ASSESSMENT = 'Bird Measurer (Assessment)'
@@ -114,20 +114,20 @@ def preprocess_events():
                 if idx % 10000 == 0:
                     print(idx)
 
-        df_data = pd.DataFrame(_postprocessing(list(game_sessions.values())))
-        df_data.fillna(0.0, inplace=True)
+        df_data = fillna0(pd.DataFrame(_postprocessing(list(game_sessions.values()))))
         df_data.to_csv(f'preprocessed-data/{prefix}_game_sessions.csv', index=False)
 
     os.makedirs('preprocessed-data', exist_ok=True)
 
-    df_train_labels = pd.read_csv(TRAIN_LABELS_CSV)
+    if not os.path.exists(TRAIN_FEATURES_CSV):
+        df_train_labels = pd.read_csv(TRAIN_LABELS_CSV)
 
-    # Only keep installation ids from train labels
-    _aggregate_game_sessions(
-        TRAIN_CSV,
-        'train',
-        installation_ids_to_keep=set(df_train_labels['installation_id'].unique())
-    )
+        # Only keep installation ids from train labels
+        _aggregate_game_sessions(
+            TRAIN_CSV,
+            'train',
+            installation_ids_to_keep=set(df_train_labels['installation_id'].unique())
+        )
 
     _aggregate_game_sessions(
         TEST_CSV,
@@ -175,6 +175,18 @@ def feature_engineering():
             ].copy(deep=True)
 
             if previous_game_sessions.shape[0] == 0:
+                game_sessions.append(
+                    pd.DataFrame({
+                        'title': '__no_title',
+                        'type': '__no_type',
+                        'world': '__no_world',
+                        'installation_id': installation_id,
+                        'assessment_start_timestamp': start_timestamp,
+                        'assessment_game_session': assessment['game_session'],
+                        'assessment_title': assessment['title'],
+                        'assessment_world': assessment['world'],
+                    }, index=[0])
+                )
                 continue
 
             # Previous attempts for current assessment
@@ -254,39 +266,41 @@ def feature_engineering():
     }
 
     df_train_labels = pd.read_csv(TRAIN_LABELS_CSV)
-    df_train = pd.read_csv('preprocessed-data/train_game_sessions.csv')
-
-    title_to_world = df_train[['title', 'world']].groupby('title').agg('first').apply(list).to_dict()
-    # Add assessment world
-    df_train_labels['world'] = df_train_labels.apply(
-        lambda assessment: title_to_world['world'][assessment['title']],
-        axis=1
-    )
-
-    print('Preparing train data...')
     # Add most common title accuracy group to assessment
     title_to_acc_group_dict = dict(
         df_train_labels.groupby('title')['accuracy_group'].agg(lambda x: x.value_counts().index[0])
     )
-    df_train_labels['assessment_most_common_title_accuracy_group'] = df_train_labels['title'] \
-        .map(title_to_acc_group_dict)
 
-    # Add game session start timestamp to train labels
-    game_session_start_timestamps = df_train.groupby(
-        ['installation_id', 'game_session']
-    ).first()['timestamp'].reset_index()
+    if not os.path.exists(TRAIN_FEATURES_CSV):
+        print('Preparing train data...')
+        df_train = pd.read_csv('preprocessed-data/train_game_sessions.csv')
 
-    df_train_labels = df_train_labels.merge(
-        game_session_start_timestamps, on=['installation_id', 'game_session'], how='left'
-    )
+        title_to_world = df_train[['title', 'world']].groupby('title').agg('first').apply(list).to_dict()
+        # Add assessment world
+        df_train_labels['world'] = df_train_labels.apply(
+            lambda assessment: title_to_world['world'][assessment['title']],
+            axis=1
+        )
 
-    _add_time_features(df_train_labels)
-    df_train['timestamp'] = (pd.to_datetime(df_train['timestamp']).astype(int) / 10 ** 9).astype(int)
+        df_train_labels['assessment_most_common_title_accuracy_group'] = df_train_labels['title'] \
+            .map(title_to_acc_group_dict)
 
-    _compute_features(df_train, 'train', df_train_labels)
+        # Add game session start timestamp to train labels
+        game_session_start_timestamps = df_train.groupby(
+            ['installation_id', 'game_session']
+        ).first()['timestamp'].reset_index()
 
-    del df_train
-    gc.collect()
+        df_train_labels = df_train_labels.merge(
+            game_session_start_timestamps, on=['installation_id', 'game_session'], how='left'
+        )
+
+        _add_time_features(df_train_labels)
+        df_train['timestamp'] = (pd.to_datetime(df_train['timestamp']).astype(int) / 10 ** 9).astype(int)
+
+        _compute_features(df_train, 'train', df_train_labels)
+
+        del df_train
+        gc.collect()
 
     print('Preparing test data...')
     df_test = pd.read_csv('preprocessed-data/test_game_sessions.csv')
@@ -313,7 +327,7 @@ def get_train_test_features():
         'assessment_game_session',
     ]
 
-    df_train_features = pd.read_csv('preprocessed-data/train_features.csv')
+    df_train_features = pd.read_csv(TRAIN_FEATURES_CSV)
     df_test_features = pd.read_csv('preprocessed-data/test_features.csv')
 
     df_train_labels = pd.read_csv(
@@ -351,29 +365,69 @@ def get_train_test_features():
     )
 
 
+def stratified_group_k_fold(X, y, groups, k, seed=None):
+    labels_num = np.max(y) + 1
+    y_counts_per_group = defaultdict(lambda: np.zeros(labels_num))
+    y_distr = Counter()
+    for label, g in zip(y, groups):
+        y_counts_per_group[g][label] += 1
+        y_distr[label] += 1
+
+    y_counts_per_fold = defaultdict(lambda: np.zeros(labels_num))
+    groups_per_fold = defaultdict(set)
+
+    def eval_y_counts_per_fold(y_counts, fold):
+        y_counts_per_fold[fold] += y_counts
+        std_per_label = []
+        for label in range(labels_num):
+            label_std = np.std([y_counts_per_fold[i][label] / y_distr[label] for i in range(k)])
+            std_per_label.append(label_std)
+        y_counts_per_fold[fold] -= y_counts
+        return np.mean(std_per_label)
+
+    groups_and_y_counts = list(y_counts_per_group.items())
+    random.Random(seed).shuffle(groups_and_y_counts)
+
+    for g, y_counts in sorted(groups_and_y_counts, key=lambda x: -np.std(x[1])):
+        best_fold = None
+        min_eval = None
+        for i in range(k):
+            fold_eval = eval_y_counts_per_fold(y_counts, i)
+            if min_eval is None or fold_eval < min_eval:
+                min_eval = fold_eval
+                best_fold = i
+        y_counts_per_fold[best_fold] += y_counts
+        groups_per_fold[best_fold].add(g)
+
+    all_groups = set(groups)
+    for i in range(k):
+        train_groups = all_groups - groups_per_fold[i]
+        test_groups = groups_per_fold[i]
+
+        train_indices = [i for i, g in enumerate(groups) if g in train_groups]
+        test_indices = [i for i, g in enumerate(groups) if g in test_groups]
+
+        yield train_indices, test_indices
+
+
 def output_submission():
     def _train():
         n_splits = 8
-        kf = GroupKFold(n_splits=n_splits)
-
         scores = []
         y_test = np.zeros((X_test.shape[0], 4))
-        for fold, (train_split, test_split) in enumerate(kf.split(X, y_target, train_installation_ids)):
+        kf = stratified_group_k_fold(X, y_target, train_installation_ids, n_splits, seed=2019)
+        for fold, (train_split, test_split) in enumerate(kf):
             print(f'Starting fold {fold}...')
 
             x_train, x_val, y_train, y_val = X[train_split], X[test_split], y_target[train_split], y_target[
                 test_split]
 
             params = {
-                'colsample_bytree': 0.5551535508116036,
-                'learning_rate': 0.01859880300849997,
-                'max_depth': 6,
-                'min_child_samples': 55,
-                'min_child_weight': 27.418512657045937,
-                'num_leaves': 6,
-                'reg_alpha': 7.554123013819799,
-                'reg_lambda': 4.4094812663177265,
-                'subsample': 0.9493215701448805
+                "colsample_bytree": 0.3154587215373795, "learning_rate": 0.08540093635431212,
+                "max_bin": 83, "max_depth": 3, "min_child_samples": 94,
+                "min_child_weight": 473.12541155319644,
+                "num_leaves": 10, "reg_alpha": 18.66439303770039, "reg_lambda": 18.123990199726602,
+                "subsample": 0.9891476916519021, "subsample_freq": 5
             }
             model = LGBMClassifier(
                 random_state=2019,
@@ -387,7 +441,7 @@ def output_submission():
 
             model.fit(
                 x_train, y_train,
-                early_stopping_rounds=500,
+                early_stopping_rounds=50,
                 eval_set=[(x_train, y_train), (x_val, y_val)],
                 verbose=100,
                 feature_name=feature_names,
@@ -401,8 +455,6 @@ def output_submission():
             score = cohen_kappa_score(y_val, pred, weights='quadratic')
             scores.append(score)
             print(score)
-
-            print('Fold done.')
 
         print(np.mean(scores))
         pd.DataFrame.from_dict({
@@ -434,6 +486,7 @@ categorical_features = [
 TRAIN_CSV = 'data/train.csv'
 TRAIN_LABELS_CSV = 'data/train_labels.csv'
 TEST_CSV = 'data/test.csv'
+TRAIN_FEATURES_CSV = 'preprocessed-data/train_features.csv'
 EVENT_PROPS_JSON = 'event_props.json'
 CORRELATED_FEATURES_JSON = 'correlated_features.json'
 FEATURE_IMPORTANCES_CSV = 'feature_importances.csv'

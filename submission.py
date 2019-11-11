@@ -172,7 +172,7 @@ def feature_engineering():
 
             previous_game_sessions: pd.DataFrame = game_sessions_for_installation_id[
                 game_sessions_for_installation_id['timestamp'] < start_timestamp
-            ].copy(deep=True)
+                ].copy(deep=True)
 
             if previous_game_sessions.shape[0] == 0:
                 game_sessions.append(
@@ -194,7 +194,7 @@ def feature_engineering():
             previous_attempts_agg = fillna0(
                 previous_game_sessions[
                     previous_game_sessions['title'] == assessment['title']
-                ].agg(aggregate_game_sessions_columns).reset_index()
+                    ].agg(aggregate_game_sessions_columns).reset_index()
             )
 
             for _, row in previous_attempts_agg.iterrows():
@@ -321,6 +321,28 @@ def feature_engineering():
     gc.collect()
 
 
+def label_encode_categorical_features(df_train, df_test):
+    for column in categorical_features:
+        lb = LabelEncoder()
+        train_column = df_train[column]
+        test_column = df_test[column]
+        lb.fit(train_column)
+        df_train[column] = lb.transform(train_column)
+        df_test[column] = lb.transform(test_column)
+
+        df_train[column] = df_train[column].astype('category')
+        df_test[column] = df_test[column].astype('category')
+
+    return df_train, df_test
+
+
+def one_hot_encode_categorical_features(df_train, df_test):
+    df_train = pd.get_dummies(df_train, columns=categorical_features)
+    df_test = pd.get_dummies(df_test, columns=categorical_features)[df_train.columns]
+
+    return df_train, df_test
+
+
 def get_train_test_features():
     columns_to_drop = [
         'installation_id',
@@ -342,15 +364,6 @@ def get_train_test_features():
     y_target = df_train_features['target'].values
     train_installation_ids = df_train_features['installation_id']
     test_installation_ids = df_test_features['installation_id']
-
-    # Encode categorical features
-    for column in categorical_features:
-        lb = LabelEncoder()
-        train_column = df_train_features[column]
-        test_column = df_test_features[column]
-        lb.fit(train_column)
-        df_train_features[column] = lb.transform(train_column)
-        df_test_features[column] = lb.transform(test_column)
 
     df_train_features = df_train_features.drop(columns=columns_to_drop + ['target'])
     # Make sure test columns are in the correct order
@@ -410,56 +423,63 @@ def stratified_group_k_fold(X, y, groups, k, seed=None):
         yield train_indices, test_indices
 
 
+def cohen_kappa_lgb_metric(labels, preds):
+    score = cohen_kappa_score(
+        labels,
+        preds.reshape((-1, 4), order='F').argmax(axis=1),
+        weights='quadratic'
+    )
+    return 'cohen_kappa', score, True
+
+
 def output_submission():
     def _train():
-        n_splits = 8
+        n_splits = 5
+
+        df_train, df_test = label_encode_categorical_features(df_train_features, df_test_features)
+
         scores = []
-        y_test = np.zeros((X_test.shape[0], 4))
-        kf = stratified_group_k_fold(X, y_target, train_installation_ids, n_splits, seed=2019)
+
+        test_pred_probs = np.zeros((df_test.shape[0], 4))
+
+        kf = stratified_group_k_fold(None, y_target, train_installation_ids, n_splits, seed=2019)
         for fold, (train_split, test_split) in enumerate(kf):
             print(f'Starting fold {fold}...')
 
-            x_train, x_val, y_train, y_val = X[train_split], X[test_split], y_target[train_split], y_target[
-                test_split]
+            x_train, x_val, y_train, y_val = df_train.iloc[train_split], df_train.iloc[test_split], \
+                                             y_target[train_split], y_target[test_split]
 
-            params = {
-                "colsample_bytree": 0.3154587215373795, "learning_rate": 0.08540093635431212,
-                "max_bin": 83, "max_depth": 3, "min_child_samples": 94,
-                "min_child_weight": 473.12541155319644,
-                "num_leaves": 10, "reg_alpha": 18.66439303770039, "reg_lambda": 18.123990199726602,
-                "subsample": 0.9891476916519021, "subsample_freq": 5
-            }
             model = LGBMClassifier(
                 random_state=2019,
                 n_estimators=100000,
-                num_classes=4,
                 objective='multiclass',
                 metric='multi_logloss',
                 n_jobs=-1,
-                **params,
+                **model_params,
             )
 
             model.fit(
                 x_train, y_train,
                 early_stopping_rounds=50,
-                eval_set=[(x_train, y_train), (x_val, y_val)],
-                verbose=100,
-                feature_name=feature_names,
-                categorical_feature=categorical_features
+                eval_set=[(x_val, y_val)],
+                eval_metric=cohen_kappa_lgb_metric,
+                verbose=50,
             )
 
-            y_test += model.predict_proba(X_test) / n_splits
+            test_pred_probs += model.predict_proba(df_test) / n_splits
 
             # Diagnostic
             pred = model.predict_proba(x_val).argmax(axis=1)
             score = cohen_kappa_score(y_val, pred, weights='quadratic')
             scores.append(score)
-            print(score)
 
-        print(np.mean(scores))
+            print('Fold score:', score)
+
+        print('Final score:', np.mean(scores))
+
         pd.DataFrame.from_dict({
             'installation_id': test_installation_ids,
-            'accuracy_group': y_test.argmax(axis=1)
+            'accuracy_group': test_pred_probs.argmax(axis=1)
         }).to_csv('submission.csv', index=False)
 
     (
@@ -470,10 +490,17 @@ def output_submission():
         test_installation_ids
     ) = get_train_test_features()
 
-    feature_names = df_train_features.columns.tolist()
-    # Features matrix
-    X = df_train_features.values
-    X_test = df_test_features.values
+    model_params = {
+        "colsample_bytree": 0.75,
+        "learning_rate": 0.5,
+        "max_bin": 255,
+        "max_depth": 10,
+        "min_child_samples": 1000,
+        "min_child_weight": 740.0726741528989,
+        "num_leaves": 255,
+        "reg_alpha": 1.0,
+        "reg_lambda": 1.0
+    }
 
     _train()
 

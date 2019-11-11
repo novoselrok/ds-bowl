@@ -7,9 +7,10 @@ from collections import defaultdict, Counter
 
 import pandas as pd
 import numpy as np
-from lightgbm import LGBMClassifier
+from lightgbm import LGBMClassifier, plot_importance
 from sklearn.metrics import cohen_kappa_score
 from sklearn.preprocessing import LabelEncoder
+import matplotlib.pyplot as plt
 
 BIRD_MEASURER_ASSESSMENT = 'Bird Measurer (Assessment)'
 
@@ -226,7 +227,7 @@ def feature_engineering():
                 print(f'Row {idx + 1}/{total_assessments} done')
 
         df_final = fillna0(pd.concat(game_sessions, ignore_index=True, sort=False))
-        df_final = pd.get_dummies(df_final, columns=['title', 'type', 'world'], prefix='cnt')
+        df_final = pd.get_dummies(df_final, columns=['title'], prefix='cnt')
 
         aggregate_columns = {
             **aggregate_game_sessions_columns,
@@ -235,11 +236,11 @@ def feature_engineering():
                for column in df_final.columns if
                column.startswith('assessment') and column != 'assessment_game_session'},
 
-            **{column: ['sum', 'mean', 'max', 'std', 'median']
+            **{column: ['sum', 'mean', 'std']
                for column in df_final.columns if column.startswith('event_data_prop')},
 
-            # Sum dummy columns (cnt_train_*, cnt_type_*, cnt_world_*, cnt_event_code_*)
-            **{column: ['sum', 'mean']
+            # Sum dummy columns (cnt_title_*, cnt_event_code_*)
+            **{column: ['sum', 'mean', 'std']
                for column in df_final.columns if column.startswith('cnt')}
         }
 
@@ -254,15 +255,15 @@ def feature_engineering():
         df_final_aggregated.to_csv(f'preprocessed-data/{prefix}_features.csv', index=False)
 
     aggregate_game_sessions_columns = {
-        'game_time': ['sum', 'mean', 'max', 'std', 'median'],
-        'event_count': ['sum', 'mean', 'max', 'std', 'median'],
-        'correct_attempts': ['sum', 'mean', 'max', 'std', 'median'],
-        'uncorrect_attempts': ['sum', 'mean', 'max', 'std', 'median'],
-        'accuracy_rate': ['sum', 'mean', 'max', 'std', 'median'],
-        'accuracy_group_0': ['sum', 'mean'],
-        'accuracy_group_1': ['sum', 'mean'],
-        'accuracy_group_2': ['sum', 'mean'],
-        'accuracy_group_3': ['sum', 'mean'],
+        'game_time': ['sum', 'mean', 'std'],
+        'event_count': ['sum', 'mean', 'std'],
+        'correct_attempts': ['sum', 'mean', 'std'],
+        'uncorrect_attempts': ['sum', 'mean', 'std'],
+        'accuracy_rate': ['mean', 'std'],
+        'accuracy_group_0': ['sum', 'mean', 'std'],
+        'accuracy_group_1': ['sum', 'mean', 'std'],
+        'accuracy_group_2': ['sum', 'mean', 'std'],
+        'accuracy_group_3': ['sum', 'mean', 'std'],
     }
 
     df_train_labels = pd.read_csv(TRAIN_LABELS_CSV)
@@ -465,6 +466,9 @@ def output_submission():
                 eval_metric=cohen_kappa_lgb_metric,
                 verbose=50,
             )
+
+            # plot_importance(model, figsize=(12, 24))
+            # plt.show()
 
             test_pred_probs += model.predict_proba(df_test) / n_splits
 

@@ -7,7 +7,7 @@ from collections import defaultdict, Counter
 
 import pandas as pd
 import numpy as np
-from lightgbm import LGBMClassifier, plot_importance
+from lightgbm import LGBMClassifier, LGBMRegressor, plot_importance
 from sklearn.metrics import cohen_kappa_score
 from sklearn.preprocessing import LabelEncoder
 import matplotlib.pyplot as plt
@@ -27,7 +27,18 @@ def preprocess_events():
         for idx in range(len(game_sessions)):
             event_codes = game_sessions[idx]['event_codes']
             event_data_props = game_sessions[idx]['event_data_props']
+            game_time = np.max(game_sessions[idx]['game_times'])
+            game_times_sorted = np.array(list(sorted(game_sessions[idx]['game_times'])))
 
+            if game_times_sorted.shape[0] <= 1:
+                game_time_mean_diff = 0.0
+                game_time_std_diff = 0.0
+            else:
+                game_times_diff = game_times_sorted[1:] - game_times_sorted[:-1]
+                game_time_mean_diff = np.mean(game_times_diff)
+                game_time_std_diff = np.std(game_times_diff)
+
+            del game_sessions[idx]['game_times']
             del game_sessions[idx]['event_codes']
             del game_sessions[idx]['event_data_props']
 
@@ -51,7 +62,10 @@ def preprocess_events():
             game_sessions[idx] = {
                 **game_sessions[idx],
                 **dict(event_codes),
-                **dict(event_data_props)
+                **dict(event_data_props),
+                'game_time': game_time,
+                'game_time_mean_diff': game_time_mean_diff,
+                'game_time_std_diff': game_time_std_diff,
             }
 
         return game_sessions
@@ -71,7 +85,7 @@ def preprocess_events():
                         'timestamp': row['timestamp'],
                         'installation_id': row['installation_id'],
                         'event_count': 0,
-                        'game_time': 0,
+                        'game_times': [],
                         'correct_attempts': 0,
                         'uncorrect_attempts': 0,
                         'title': row['title'],
@@ -84,7 +98,7 @@ def preprocess_events():
                 game_session = game_sessions[row['game_session']]
 
                 game_session['event_count'] = max(game_session['event_count'], int(row['event_count']))
-                game_session['game_time'] = max(game_session['game_time'], int(row['game_time']))
+                game_session['game_times'].append(int(row['game_time']))
 
                 event_data = json.loads(row['event_data'])
                 event_code = int(row['event_code'])
@@ -182,24 +196,25 @@ def feature_engineering():
                         'type': '__no_type',
                         'world': '__no_world',
                         'installation_id': installation_id,
-                        'assessment_start_timestamp': start_timestamp,
                         'assessment_game_session': assessment['game_session'],
                         'assessment_title': assessment['title'],
                         'assessment_world': assessment['world'],
+                        'assessment_most_common_title_accuracy_group': assessment[
+                            'assessment_most_common_title_accuracy_group'],
+                        'assessment_dayofweek': assessment['assessment_dayofweek'],
+                        'assessment_hour': assessment['assessment_hour'],
                     }, index=[0])
                 )
                 continue
 
             # Previous attempts for current assessment
             # Which attempt, accuracy groups for current assessment, correct/incorrect/rate attempts
-            previous_attempts_agg = fillna0(
-                previous_game_sessions[
-                    previous_game_sessions['title'] == assessment['title']
-                    ].agg(aggregate_game_sessions_columns).reset_index()
-            )
+            previous_attempts_agg = previous_game_sessions[
+                previous_game_sessions['title'] == assessment['title']
+                ].agg(aggregate_assessment_game_session_columns).reset_index()
 
             for _, row in previous_attempts_agg.iterrows():
-                for column in aggregate_game_sessions_columns.keys():
+                for column in aggregate_assessment_game_session_columns.keys():
                     previous_game_sessions[f'assessment_previous_{column}_{row["index"]}'] = row[column]
 
             # Everything with the assessment_* prefix is related to
@@ -226,44 +241,67 @@ def feature_engineering():
             if idx % 100 == 0:
                 print(f'Row {idx + 1}/{total_assessments} done')
 
-        df_final = fillna0(pd.concat(game_sessions, ignore_index=True, sort=False))
-        df_final = pd.get_dummies(df_final, columns=['title'], prefix='cnt')
+        df_final = pd.concat(game_sessions, ignore_index=True, sort=False)
+        assessment_game_sessions = df_final['type'] == 'Assessment'
+        df_final = pd.get_dummies(df_final, columns=['title', 'type', 'world'], prefix='ttw')
 
-        aggregate_columns = {
+        _agg_cols = {
             **aggregate_game_sessions_columns,
 
             **{column: 'first'
-               for column in df_final.columns if
-               column.startswith('assessment') and column != 'assessment_game_session'},
+               for column in df_final.columns
+               if column.startswith('assessment') and column != 'assessment_game_session'},
 
-            **{column: ['sum', 'mean', 'std']
+            **{column: ['std', 'mean', 'median', 'max']
                for column in df_final.columns if column.startswith('event_data_prop')},
 
-            # Sum dummy columns (cnt_title_*, cnt_event_code_*)
-            **{column: ['sum', 'mean', 'std']
-               for column in df_final.columns if column.startswith('cnt')}
+            **{column: ['std', 'mean', 'median', 'max']
+               for column in df_final.columns if column.startswith('cnt')},
+
+            # Sum dummy columns (ttw_(title*), etc.)
+            **{column: 'sum'
+               for column in df_final.columns if column.startswith('ttw')}
         }
 
-        df_final_aggregated = fillna0(
-            df_final[
-                ['installation_id', 'assessment_game_session', *aggregate_columns.keys()]
-            ].groupby(['installation_id', 'assessment_game_session']).agg(aggregate_columns).reset_index()
+        df_final_aggregated = df_final[['installation_id', 'assessment_game_session', *_agg_cols.keys()]] \
+            .groupby(['installation_id', 'assessment_game_session']) \
+            .agg(_agg_cols) \
+            .reset_index()
+
+        df_final_assessments_aggregated = df_final[assessment_game_sessions] \
+            [['installation_id', 'assessment_game_session', *aggregate_assessment_game_session_columns.keys()]] \
+            .groupby(['installation_id', 'assessment_game_session']) \
+            .agg(aggregate_assessment_game_session_columns) \
+            .reset_index()
+
+        df_final_aggregated.columns = [
+            _get_aggregated_column_name(column) for column in df_final_aggregated.columns
+        ]
+
+        df_final_assessments_aggregated.columns = [
+            _get_aggregated_column_name(column) for column in df_final_assessments_aggregated.columns
+        ]
+
+        df_final_aggregated = df_final_aggregated.merge(
+            df_final_assessments_aggregated,
+            on=['installation_id', 'assessment_game_session'],
+            how='left'
         )
-        df_final_aggregated.columns = [_get_aggregated_column_name(column) for column in df_final_aggregated.columns]
 
         print('Writing features...')
         df_final_aggregated.to_csv(f'preprocessed-data/{prefix}_features.csv', index=False)
 
     aggregate_game_sessions_columns = {
-        'game_time': ['sum', 'mean', 'std'],
-        'event_count': ['sum', 'mean', 'std'],
-        'correct_attempts': ['sum', 'mean', 'std'],
-        'uncorrect_attempts': ['sum', 'mean', 'std'],
-        'accuracy_rate': ['mean', 'std'],
-        'accuracy_group_0': ['sum', 'mean', 'std'],
-        'accuracy_group_1': ['sum', 'mean', 'std'],
-        'accuracy_group_2': ['sum', 'mean', 'std'],
-        'accuracy_group_3': ['sum', 'mean', 'std'],
+        'game_time': ['std', 'mean', 'median', 'max'],
+        'event_count': ['std', 'mean', 'median', 'max'],
+        'game_time_mean_diff': ['std', 'mean', 'median', 'max'],
+        'game_time_std_diff': ['std', 'mean', 'median', 'max'],
+    }
+
+    aggregate_assessment_game_session_columns = {
+        'correct_attempts': ['std', 'mean', 'median', 'max'],
+        'uncorrect_attempts': ['std', 'mean', 'median', 'max'],
+        'accuracy_rate': ['std', 'mean', 'median', 'max'],
     }
 
     df_train_labels = pd.read_csv(TRAIN_LABELS_CSV)
@@ -355,25 +393,31 @@ def get_train_test_features():
 
     df_train_labels = pd.read_csv(
         TRAIN_LABELS_CSV,
-        usecols=['installation_id', 'game_session', 'accuracy_group']
-    ).rename({'game_session': 'assessment_game_session', 'accuracy_group': 'target'}, axis=1)
+        usecols=['installation_id', 'game_session', 'num_correct', 'num_incorrect', 'accuracy_group']
+    ).rename({'game_session': 'assessment_game_session'}, axis=1)
 
     # Add target to train features
     df_train_features = df_train_features.merge(df_train_labels, on=['installation_id', 'assessment_game_session'])
 
     # Extract target and installation ids
-    y_target = df_train_features['target'].values
+    y_correct = df_train_features['num_correct'].values
+    y_uncorrect = df_train_features['num_incorrect'].values
+    y_accuracy_group = df_train_features['accuracy_group'].values
     train_installation_ids = df_train_features['installation_id']
     test_installation_ids = df_test_features['installation_id']
 
-    df_train_features = df_train_features.drop(columns=columns_to_drop + ['target'])
+    df_train_features = df_train_features.drop(
+        columns=columns_to_drop + ['num_correct', 'num_incorrect', 'accuracy_group']
+    )
     # Make sure test columns are in the correct order
     df_test_features = df_test_features.drop(columns=columns_to_drop)[df_train_features.columns]
 
     return (
         df_train_features,
         df_test_features,
-        y_target,
+        y_correct,
+        y_uncorrect,
+        y_accuracy_group,
         train_installation_ids,
         test_installation_ids
     )
@@ -433,6 +477,51 @@ def cohen_kappa_lgb_metric(labels, preds):
     return 'cohen_kappa', score, True
 
 
+def get_correct_attempts_clf(model_params):
+    return LGBMClassifier(
+        random_state=2019,
+        n_estimators=5000,
+        n_jobs=-1,
+        objective='binary',
+        metric='binary_logloss',
+        **model_params
+    )
+
+
+def get_uncorrect_attempts_reg(model_params):
+    return LGBMRegressor(
+        random_state=2019,
+        n_estimators=5000,
+        n_jobs=-1,
+        **model_params
+    )
+
+
+def fit_model(model, x_train, y_train, x_val, y_val):
+    model.fit(
+        x_train, y_train,
+        early_stopping_rounds=100,
+        eval_set=[(x_val, y_val)],
+        verbose=0,
+    )
+
+
+def attempts_to_group(correct_proba, uncorrect):
+    uncorrect = uncorrect if uncorrect >= 0 else 0
+    if correct_proba[0] > 0.4:
+        return 0
+
+    if correct_proba[0] < 0.07:
+        return 3
+
+    if uncorrect < 1:
+        return 3
+    if uncorrect < 2:
+        return 2
+
+    return 1
+
+
 def output_submission():
     def _train():
         n_splits = 5
@@ -441,69 +530,88 @@ def output_submission():
 
         scores = []
 
-        test_pred_probs = np.zeros((df_test.shape[0], 4))
+        test_preds = np.zeros((df_test.shape[0], n_splits))
 
-        kf = stratified_group_k_fold(None, y_target, train_installation_ids, n_splits, seed=2019)
+        kf = stratified_group_k_fold(None, y_accuracy_group, train_installation_ids, n_splits, seed=2019)
         for fold, (train_split, test_split) in enumerate(kf):
             print(f'Starting fold {fold}...')
 
-            x_train, x_val, y_train, y_val = df_train.iloc[train_split], df_train.iloc[test_split], \
-                                             y_target[train_split], y_target[test_split]
+            x_train, x_val = df_train.iloc[train_split, :], df_train.iloc[test_split, :]
+            y_correct_train, y_correct_val = y_correct[train_split], y_correct[test_split]
+            y_uncorrect_train, y_uncorrect_val = y_uncorrect[train_split], y_uncorrect[test_split]
 
-            model = LGBMClassifier(
-                random_state=2019,
-                n_estimators=100000,
-                objective='multiclass',
-                metric='multi_logloss',
-                n_jobs=-1,
-                **model_params,
-            )
+            correct_attempts_clf = get_correct_attempts_clf(clf_correct_attempts_params)
+            uncorrect_attempts_reg = get_uncorrect_attempts_reg(reg_uncorrect_attempts_params)
 
-            model.fit(
-                x_train, y_train,
-                early_stopping_rounds=50,
-                eval_set=[(x_val, y_val)],
-                eval_metric=cohen_kappa_lgb_metric,
-                verbose=50,
-            )
+            fit_model(correct_attempts_clf, x_train, y_correct_train, x_val, y_correct_val)
+            fit_model(uncorrect_attempts_reg, x_train, y_uncorrect_train, x_val, y_uncorrect_val)
 
-            # plot_importance(model, figsize=(12, 24))
-            # plt.show()
+            plot_importance(correct_attempts_clf, figsize=(12, 36), max_num_features=20)
+            plt.show()
+            plot_importance(uncorrect_attempts_reg, figsize=(12, 36), max_num_features=20)
+            plt.show()
 
-            test_pred_probs += model.predict_proba(df_test) / n_splits
+            correct_attempts_pred = correct_attempts_clf.predict_proba(df_test)
+            uncorrect_attempts_pred = uncorrect_attempts_reg.predict(df_test)
+            accuracy_group_pred = [
+                attempts_to_group(c, u) for c, u in zip(correct_attempts_pred, uncorrect_attempts_pred)
+            ]
+            test_preds[:, fold] = accuracy_group_pred
 
-            # Diagnostic
-            pred = model.predict_proba(x_val).argmax(axis=1)
-            score = cohen_kappa_score(y_val, pred, weights='quadratic')
+            correct_attempts_val_pred = correct_attempts_clf.predict_proba(x_val)
+            uncorrect_attempts_val_pred = uncorrect_attempts_reg.predict(x_val)
+            accuracy_group_val_pred = [
+                attempts_to_group(c, u) for c, u in zip(correct_attempts_val_pred, uncorrect_attempts_val_pred)
+            ]
+
+            score = cohen_kappa_score(y_accuracy_group[test_split], accuracy_group_val_pred, weights='quadratic')
             scores.append(score)
-
-            print('Fold score:', score)
 
         print('Final score:', np.mean(scores))
 
+        accuracy_groups = []
+        for row in test_preds:
+            cnts = np.bincount(row.astype(int), minlength=4)
+            group = cnts.argmax()
+            accuracy_groups.append(group)
+
         pd.DataFrame.from_dict({
             'installation_id': test_installation_ids,
-            'accuracy_group': test_pred_probs.argmax(axis=1)
+            'accuracy_group': accuracy_groups
         }).to_csv('submission.csv', index=False)
 
     (
         df_train_features,
         df_test_features,
-        y_target,
+        y_correct,
+        y_uncorrect,
+        y_accuracy_group,
         train_installation_ids,
         test_installation_ids
     ) = get_train_test_features()
 
-    model_params = {
-        "colsample_bytree": 0.75,
-        "learning_rate": 0.5,
-        "max_bin": 255,
-        "max_depth": 10,
-        "min_child_samples": 1000,
-        "min_child_weight": 740.0726741528989,
-        "num_leaves": 255,
-        "reg_alpha": 1.0,
-        "reg_lambda": 1.0
+    clf_correct_attempts_params = {
+        "colsample_bytree": 0.1248098023982449,
+        "learning_rate": 0.10342583432650229,
+        "max_bin": 187,
+        "max_depth": 4,
+        "min_child_samples": 235,
+        "min_child_weight": 7.445893668578389,
+        "num_leaves": 193,
+        "reg_alpha": 12.398553150143126,
+        "reg_lambda": 24.496136535125633
+    }
+
+    reg_uncorrect_attempts_params = {
+        "colsample_bytree": 0.3903008048793679,
+        "learning_rate": 0.15882978384614804,
+        "max_bin": 351,
+        "max_depth": 9,
+        "min_child_samples": 1304,
+        "min_child_weight": 498.0164877147689,
+        "num_leaves": 16,
+        "reg_alpha": 2.5843001310082196,
+        "reg_lambda": 18.35238370653897
     }
 
     _train()
@@ -521,3 +629,5 @@ TRAIN_FEATURES_CSV = 'preprocessed-data/train_features.csv'
 EVENT_PROPS_JSON = 'event_props.json'
 CORRELATED_FEATURES_JSON = 'correlated_features.json'
 FEATURE_IMPORTANCES_CSV = 'feature_importances.csv'
+
+output_submission()

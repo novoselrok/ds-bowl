@@ -7,10 +7,9 @@ from collections import defaultdict, Counter
 
 import pandas as pd
 import numpy as np
-from lightgbm import LGBMClassifier, LGBMRegressor, plot_importance
+from lightgbm import LGBMClassifier, LGBMRegressor
 from sklearn.metrics import cohen_kappa_score
 from sklearn.preprocessing import LabelEncoder
-import matplotlib.pyplot as plt
 
 BIRD_MEASURER_ASSESSMENT = 'Bird Measurer (Assessment)'
 
@@ -468,15 +467,6 @@ def stratified_group_k_fold(X, y, groups, k, seed=None):
         yield train_indices, test_indices
 
 
-def cohen_kappa_lgb_metric(labels, preds):
-    score = cohen_kappa_score(
-        labels,
-        preds.reshape((-1, 4), order='F').argmax(axis=1),
-        weights='quadratic'
-    )
-    return 'cohen_kappa', score, True
-
-
 def get_correct_attempts_clf(model_params):
     return LGBMClassifier(
         random_state=2019,
@@ -545,11 +535,6 @@ def output_submission():
 
             fit_model(correct_attempts_clf, x_train, y_correct_train, x_val, y_correct_val)
             fit_model(uncorrect_attempts_reg, x_train, y_uncorrect_train, x_val, y_uncorrect_val)
-
-            plot_importance(correct_attempts_clf, figsize=(12, 36), max_num_features=20)
-            plt.show()
-            plot_importance(uncorrect_attempts_reg, figsize=(12, 36), max_num_features=20)
-            plt.show()
 
             correct_attempts_pred = correct_attempts_clf.predict_proba(df_test)
             uncorrect_attempts_pred = uncorrect_attempts_reg.predict(df_test)
@@ -629,5 +614,3 @@ TRAIN_FEATURES_CSV = 'preprocessed-data/train_features.csv'
 EVENT_PROPS_JSON = 'event_props.json'
 CORRELATED_FEATURES_JSON = 'correlated_features.json'
 FEATURE_IMPORTANCES_CSV = 'feature_importances.csv'
-
-output_submission()

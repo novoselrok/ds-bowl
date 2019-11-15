@@ -7,26 +7,11 @@ from sklearn.metrics import cohen_kappa_score
 import matplotlib.pyplot as plt
 
 from submission import get_train_test_features, stratified_group_k_fold, \
-    label_encode_categorical_features, get_correct_attempts_clf, get_uncorrect_attempts_reg, fit_model
-
+    label_encode_categorical_features, get_correct_attempts_clf, get_uncorrect_attempts_reg, fit_model, \
+    attempts_to_group
 
 plt.rc('xtick', labelsize=8)
 plt.rc('ytick', labelsize=8)
-
-def attempts_to_group(correct_proba, uncorrect):
-    uncorrect = uncorrect if uncorrect >= 0 else 0
-    if correct_proba[0] > 0.4:
-        return 0
-
-    if correct_proba[0] < 0.06:
-        return 3
-
-    if uncorrect < 1:
-        return 3
-    if uncorrect < 2:
-        return 2
-
-    return 1
 
 
 def lgb_multi_model_eval(**params):

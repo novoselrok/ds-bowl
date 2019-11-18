@@ -11,6 +11,128 @@ from lightgbm import LGBMClassifier, LGBMRegressor
 from sklearn.metrics import cohen_kappa_score
 from sklearn.preprocessing import LabelEncoder
 
+important_event_ids = {'05ad839b',
+                       '08ff79ad',
+                       '0d18d96c',
+                       '0db6d71d',
+                       '1325467d',
+                       '15a43e5b',
+                       '19967db1',
+                       '222660ff',
+                       '2230fab4',
+                       '250513af',
+                       '262136f4',
+                       '28a4eb9a',
+                       '28f975ea',
+                       '2b058fe3',
+                       '2dc29e21',
+                       '30614231',
+                       '31973d56',
+                       '3393b68b',
+                       '363c86c9',
+                       '37937459',
+                       '3afb49e6',
+                       '3afde5dd',
+                       '3bb91dda',
+                       '3bf1cf26',
+                       '3d63345e',
+                       '3ddc79c3',
+                       '3edf6747',
+                       '3ee399c3',
+                       '45d01abe',
+                       '461eace6',
+                       '47026d5f',
+                       '47efca07',
+                       '47f43a44',
+                       '499edb7c',
+                       '4bb2f698',
+                       '4e5fc6f5',
+                       '4ef8cdd3',
+                       '5290eab1',
+                       '565a3990',
+                       '5859dfb6',
+                       '587b5989',
+                       '5c2f29ca',
+                       '5c3d2b2f',
+                       '5e3ea25a',
+                       '5f0eb72c',
+                       '6043a2b4',
+                       '67aa2ada',
+                       '6aeafed4',
+                       '6c517a88',
+                       '6f4adc4b',
+                       '6f4bd64e',
+                       '6f8106d9',
+                       '731c0cbe',
+                       '7372e1a5',
+                       '73757a5e',
+                       '74e5f8a7',
+                       '76babcde',
+                       '77c76bc5',
+                       '77ead60d',
+                       '7da34a02',
+                       '7dfe6d8a',
+                       '804ee27f',
+                       '84538528',
+                       '85d1b0de',
+                       '86c924c4',
+                       '884228c8',
+                       '88d4a5be',
+                       '89aace00',
+                       '8af75982',
+                       '8b757ab8',
+                       '8d748b58',
+                       '8fee50e2',
+                       '90efca10',
+                       '92687c59',
+                       '93edfe2e',
+                       '9b4001e4',
+                       '9ce586dd',
+                       '9d29771f',
+                       '9e34ea74',
+                       'a0faea5d',
+                       'a16a373e',
+                       'a2df0760',
+                       'a44b10dc',
+                       'a5be6304',
+                       'a7640a16',
+                       'a8876db3',
+                       'ac92046e',
+                       'acf5c23f',
+                       'b2e5b0f1',
+                       'bc8f2793',
+                       'bcceccc6',
+                       'bd612267',
+                       'c0415e5c',
+                       'c51d8688',
+                       'c58186bf',
+                       'c7fe2a55',
+                       'c952eb01',
+                       'cb1178ad',
+                       'cdd22e43',
+                       'cf82af56',
+                       'd02b7a8e',
+                       'd185d3ea',
+                       'd2e9262e',
+                       'd3268efa',
+                       'd3640339',
+                       'd38c2fd7',
+                       'd3f1e122',
+                       'd45ed6a1',
+                       'daac11b0',
+                       'de26c3a6',
+                       'df4fe8b6',
+                       'e04fb33d',
+                       'e080a381',
+                       'e37a2b78',
+                       'e3ff61fb',
+                       'e57dd7af',
+                       'e694a35b',
+                       'e7e44842',
+                       'eb2c19cd',
+                       'f3cd5473',
+                       'f54238ee'}
+
 BIRD_MEASURER_ASSESSMENT = 'Bird Measurer (Assessment)'
 
 
@@ -19,13 +141,10 @@ def fillna0(df):
 
 
 def preprocess_events():
-    with open(EVENT_PROPS_JSON, encoding='utf-8') as f:
-        event_ids_to_props = json.load(f)
-
     def _postprocessing(game_sessions):
         for idx in range(len(game_sessions)):
             event_codes = game_sessions[idx]['event_codes']
-            event_data_props = game_sessions[idx]['event_data_props']
+            event_ids = game_sessions[idx]['event_ids']
             game_time = np.max(game_sessions[idx]['game_times'])
             game_times_sorted = np.array(list(sorted(game_sessions[idx]['game_times'])))
 
@@ -39,7 +158,6 @@ def preprocess_events():
 
             del game_sessions[idx]['game_times']
             del game_sessions[idx]['event_codes']
-            del game_sessions[idx]['event_data_props']
 
             correct, uncorrect = game_sessions[idx]['correct_attempts'], game_sessions[idx]['uncorrect_attempts']
             if correct == 0 and uncorrect == 0:
@@ -61,7 +179,7 @@ def preprocess_events():
             game_sessions[idx] = {
                 **game_sessions[idx],
                 **dict(event_codes),
-                **dict(event_data_props),
+                **dict(event_ids),
                 'game_time': game_time,
                 'game_time_mean_diff': game_time_mean_diff,
                 'game_time_std_diff': game_time_std_diff,
@@ -91,7 +209,8 @@ def preprocess_events():
                         'type': row['type'],
                         'world': row['world'],
                         'event_codes': defaultdict(int),
-                        'event_data_props': defaultdict(int)
+                        'event_ids': defaultdict(int),
+                        # 'event_data_props': defaultdict(int)
                     }
 
                 game_session = game_sessions[row['game_session']]
@@ -121,9 +240,8 @@ def preprocess_events():
                             game_session['uncorrect_attempts'] += 1
 
                 event_id = row['event_id']
-                if event_id in event_ids_to_props:
-                    for prop in event_ids_to_props[event_id]:
-                        game_session['event_data_props'][f'event_data_prop_{event_id}_{prop}'] += event_data[prop]
+                if event_id in important_event_ids:
+                    game_session['event_ids'][f'cnt_event_id_{event_id}'] += 1
 
                 if idx % 10000 == 0:
                     print(idx)
@@ -250,9 +368,6 @@ def feature_engineering():
             **{column: 'first'
                for column in df_final.columns
                if column.startswith('assessment') and column != 'assessment_game_session'},
-
-            **{column: ['std', 'mean', 'median', 'max']
-               for column in df_final.columns if column.startswith('event_data_prop')},
 
             **{column: ['std', 'mean', 'median', 'max']
                for column in df_final.columns if column.startswith('cnt')},
@@ -576,27 +691,31 @@ def output_submission():
     ) = get_train_test_features()
 
     clf_correct_attempts_params = {
-        "colsample_bytree": 0.1248098023982449,
-        "learning_rate": 0.10342583432650229,
-        "max_bin": 187,
-        "max_depth": 4,
-        "min_child_samples": 235,
-        "min_child_weight": 7.445893668578389,
-        "num_leaves": 193,
-        "reg_alpha": 12.398553150143126,
-        "reg_lambda": 24.496136535125633
+        "colsample_bytree": 0.48800692625786024,
+        "learning_rate": 0.1020388475140511,
+        "max_bin": 253,
+        "max_depth": 6,
+        "min_child_samples": 55,
+        "min_child_weight": 96.41746550933172,
+        "num_leaves": 227,
+        "reg_alpha": 2.5075658866930826,
+        "reg_lambda": 26.531548533942157,
+        "subsample": 0.8135279342738913,
+        "subsample_freq": 1,
     }
 
     reg_uncorrect_attempts_params = {
-        "colsample_bytree": 0.3903008048793679,
-        "learning_rate": 0.15882978384614804,
-        "max_bin": 351,
-        "max_depth": 9,
-        "min_child_samples": 1304,
-        "min_child_weight": 498.0164877147689,
-        "num_leaves": 16,
-        "reg_alpha": 2.5843001310082196,
-        "reg_lambda": 18.35238370653897
+        "colsample_bytree": 0.22442543382762706,
+        "learning_rate": 0.1449358327239709,
+        "max_bin": 11,
+        "max_depth": 5,
+        "min_child_samples": 804,
+        "min_child_weight": 986.686500096391,
+        "num_leaves": 38,
+        "reg_alpha": 25.08821535738595,
+        "reg_lambda": 29.658691679324352,
+        "subsample": 0.6076212307221736,
+        "subsample_freq": 4
     }
 
     _train()

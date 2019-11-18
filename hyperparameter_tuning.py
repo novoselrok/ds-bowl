@@ -3,59 +3,19 @@ import os
 import numpy as np
 from bayes_opt import BayesianOptimization, JSONLogger, Events
 from bayes_opt.util import load_logs
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import cohen_kappa_score
+from lightgbm import LGBMClassifier, LGBMRegressor
 import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
 
-from submission import get_train_test_features, stratified_group_k_fold, \
-    label_encode_categorical_features, get_correct_attempts_clf, get_uncorrect_attempts_reg, fit_model, \
-    attempts_to_group
+from submission import stratified_group_k_fold, get_train_test_features, label_encode_categorical_features
 
 plt.rc('xtick', labelsize=8)
 plt.rc('ytick', labelsize=8)
 
 
 def lgb_multi_model_eval(**params):
-    def lgb_score(
-            x_train, _x_val,
-            y_correct_train, _y_correct_val,
-            y_uncorrect_train, _y_uncorrect_val,
-            y_val_accuracy_group,
-            val_installation_ids,
-            clf_correct_attempts_params,
-            reg_uncorrect_attempts_params,
-    ):
-        oof_pred = np.zeros((_x_val.shape[0], 2))
-        scores = []
-        for (val_split, test_split) in stratified_group_k_fold(None, y_val_accuracy_group, val_installation_ids, 2,
-                                                               seed=2019):
-            x_val = _x_val.iloc[val_split]
-            y_correct_val = _y_correct_val[val_split]
-            y_uncorrect_val = _y_uncorrect_val[val_split]
-
-            x_test = _x_val.iloc[test_split]
-
-            correct_attempts_clf = get_correct_attempts_clf(clf_correct_attempts_params)
-            uncorrect_attempts_reg = get_uncorrect_attempts_reg(reg_uncorrect_attempts_params)
-
-            fit_model(correct_attempts_clf, x_train, y_correct_train, x_val, y_correct_val)
-            fit_model(uncorrect_attempts_reg, x_train, y_uncorrect_train, x_val, y_uncorrect_val)
-
-            correct_attempts_pred = correct_attempts_clf.predict_proba(x_test)
-            uncorrect_attempts_pred = uncorrect_attempts_reg.predict(x_test)
-
-            oof_pred[test_split, 0] = correct_attempts_pred[:, 0]
-            oof_pred[test_split, 1] = uncorrect_attempts_pred
-
-            accuracy_group_pred = [
-                attempts_to_group(c, u) for c, u in zip(correct_attempts_pred, uncorrect_attempts_pred)
-            ]
-
-            score = cohen_kappa_score(y_val_accuracy_group[test_split], accuracy_group_pred, weights='quadratic')
-            scores.append(score)
-
-        print(scores)
-        return np.mean(scores), oof_pred
-
     (
         df_train_features,
         df_test_features,
@@ -66,72 +26,188 @@ def lgb_multi_model_eval(**params):
         _test_installation_ids
     ) = get_train_test_features()
 
-    integer_params = ['max_depth', 'max_bin', 'num_leaves', 'min_child_samples', 'n_splits', 'subsample_freq']
+    integer_params = ['max_depth', 'max_bin', 'num_leaves',
+                      'min_child_samples', 'n_splits', 'subsample_freq', 'bagging_freq']
     df_train, _ = label_encode_categorical_features(df_train_features, df_test_features)
-    return cv(lgb_score,
-              df_train, y_correct, y_uncorrect, y_accuracy_group, train_installation_ids, integer_params, **params)
+
+    model_names = ['accuracy_group', 'correct_attempts', 'uncorrect_attempts']
+    models_specs = []
+
+    for name in model_names:
+        model_params = {param.split(':')[1]: value for param, value in params.items() if param.startswith(name)}
+
+        for param, value in model_params.items():
+            if param in integer_params:
+                model_params[param] = int(round(value))
+
+        models_specs.append({'name': name, 'params': model_params})
+
+    return cv(df_train, y_accuracy_group, y_correct, y_uncorrect, train_installation_ids, models_specs)
 
 
-def cv(score_fn, df_train, y_correct, y_uncorrect, y_accuracy_group, train_installation_ids, integer_params, **params):
-    n_splits = 5
-
-    clf_correct_attempts_params = {}
-    reg_uncorrect_attempts_params = {}
-
-    for param, value in params.items():
-        [model, param_name] = param.split(':')
-
-        if param_name in integer_params:
-            value = int(value)
-
-        if model == 'clf_correct_attempts':
-            clf_correct_attempts_params[param_name] = value
-        else:
-            reg_uncorrect_attempts_params[param_name] = value
-
-    scores = []
-    oof_preds = np.zeros((df_train.shape[0], 2))
-    kf = stratified_group_k_fold(df_train, y_accuracy_group, train_installation_ids, n_splits, seed=2019)
-    for fold, (train_split, test_split) in enumerate(kf):
-        x_train, x_val = df_train.iloc[train_split, :], df_train.iloc[test_split, :]
-        y_correct_train, y_correct_val = y_correct[train_split], y_correct[test_split]
-        y_uncorrect_train, y_uncorrect_val = y_uncorrect[train_split], y_uncorrect[test_split]
-
-        score, oof_pred = score_fn(
-            x_train, x_val,
-            y_correct_train, y_correct_val,
-            y_uncorrect_train, y_uncorrect_val,
-            y_accuracy_group[test_split],
-            train_installation_ids[test_split],
-            clf_correct_attempts_params,
-            reg_uncorrect_attempts_params,
+def get_model(model_spec):
+    if model_spec['name'] == 'accuracy_group':
+        return LGBMClassifier(
+            random_state=2019,
+            n_estimators=5000,
+            n_jobs=-1,
+            objective='multiclass',
+            metric='multi_logloss',
+            **model_spec['params']
+        )
+    elif model_spec['name'] == 'correct_attempts':
+        return LGBMClassifier(
+            random_state=2019,
+            n_estimators=5000,
+            n_jobs=-1,
+            objective='binary',
+            metric='binary_logloss',
+            **model_spec['params']
+        )
+    elif model_spec['name'] == 'uncorrect_attempts':
+        return LGBMRegressor(
+            random_state=2019,
+            n_estimators=5000,
+            n_jobs=-1,
+            **model_spec['params']
         )
 
-        oof_preds[test_split, :] = oof_pred
+    raise Exception(f'Unknown model {model_spec["name"]}')
 
-        print("Done fold")
-        print(score)
-        scores.append(score)
 
-    # color_map = {
-    #     0: 'red',
-    #     1: 'green',
-    #     2: 'blue',
-    #     3: 'black',
-    # }
-    #
-    # for group, color in color_map.items():
-    #     # plt.scatter(oof_preds[y_accuracy_group == group, 0], oof_preds[y_accuracy_group == group, 1], c=color)
-    #     plt.title("group " + str(group) + " n samples: " + str((y_accuracy_group == group).sum()))
-    #     plt.xlabel('probabilty of not solving correctly')
-    #     plt.ylabel('uncorrect attempts')
-    #     plt.xticks(np.arange(0, 1, step=0.05))
-    #     plt.yticks(np.arange(0, 10, step=0.25))
-    #     plt.hist2d(oof_preds[y_accuracy_group == group, 0], oof_preds[y_accuracy_group == group, 1], bins=[20, 40])
-    #     plt.show()
+def fit_model(
+        model_spec,
+        model,
+        X_train, y_train_accuracy_group, y_train_correct_attempts, y_train_uncorrect_attempts,
+        X_val, y_val_accuracy_group, y_val_correct_attempts, y_val_uncorrect_attempts
+):
+    if model_spec['name'] == 'accuracy_group':
+        model.fit(
+            X_train, y_train_accuracy_group,
+            early_stopping_rounds=10,
+            eval_set=[(X_val, y_val_accuracy_group)],
+            verbose=0,
+        )
+    elif model_spec['name'] == 'correct_attempts':
+        model.fit(
+            X_train, y_train_correct_attempts,
+            early_stopping_rounds=10,
+            eval_set=[(X_val, y_val_correct_attempts)],
+            verbose=0,
+        )
+    elif model_spec['name'] == 'uncorrect_attempts':
+        model.fit(
+            X_train, y_train_uncorrect_attempts,
+            early_stopping_rounds=10,
+            eval_set=[(X_val, y_val_uncorrect_attempts)],
+            verbose=0,
+        )
+    else:
+        raise Exception(f'Unknown model {model_spec["name"]}')
 
-    print(np.mean(scores))
-    return np.mean(scores)
+
+def predict_model(model_spec, model, X_test):
+    if model_spec['name'] == 'accuracy_group':
+        return model.predict_proba(X_test)
+    elif model_spec['name'] == 'correct_attempts':
+        return model.predict_proba(X_test)
+    elif model_spec['name'] == 'uncorrect_attempts':
+        return model.predict(X_test).reshape((-1, 1))
+
+    raise Exception(f'Unknown model {model_spec["name"]}')
+
+
+def get_train_test_split(df_data, targets, train_split, test_split):
+    df_train = df_data.iloc[train_split, :]
+    df_test = df_data.iloc[test_split, :]
+
+    train_targets = [target[train_split] for target in targets]
+    test_targets = [target[test_split] for target in targets]
+
+    return tuple([df_train] + train_targets), tuple([df_test] + test_targets)
+
+
+def oof_predict(
+        X_train, y_train_accuracy_group, y_train_correct_attempts, y_train_uncorrect_attempts,
+        X_test, y_test_accuracy_group, y_test_correct_attempts, y_test_uncorrect_attempts,
+        X_holdout, models_specs
+):
+    predictions = []
+    holdout_predictions = []
+
+    for idx, model_spec in enumerate(models_specs):
+        model = get_model(model_spec)
+
+        fit_model(
+            model_spec, model,
+            X_train, y_train_accuracy_group, y_train_correct_attempts, y_train_uncorrect_attempts,
+            X_test, y_test_accuracy_group, y_test_correct_attempts, y_test_uncorrect_attempts
+        )
+
+        predictions.append(predict_model(model_spec, model, X_test))
+        holdout_predictions.append(predict_model(model_spec, model, X_holdout))
+
+    return np.concatenate(predictions, axis=1), np.concatenate(holdout_predictions, axis=1)
+
+
+def predict(df_data, target_accuracy_group, target_correct_attempts, target_uncorrect_attempts,
+            train_split, test_split, X_holdout, models_specs):
+    (X_train, y_train_accuracy_group, y_train_correct_attempts, y_train_uncorrect_attempts), \
+        (X_test, y_test_accuracy_group, y_test_correct_attempts, y_test_uncorrect_attempts) = get_train_test_split(
+        df_data, [target_accuracy_group, target_correct_attempts, target_uncorrect_attempts], train_split, test_split)
+
+    return oof_predict(
+        X_train, y_train_accuracy_group, y_train_correct_attempts, y_train_uncorrect_attempts,
+        X_test, y_test_accuracy_group, y_test_correct_attempts, y_test_uncorrect_attempts,
+        X_holdout, models_specs
+    )
+
+
+def cv(df_train, target_accuracy_group, target_correct_attempts, target_uncorrect_attempts, installation_ids,
+       models_specs):
+    n_outer_splits = 5
+    n_inner_splits = 4
+
+    oof_predictions = np.zeros(df_train.shape[0])
+
+    outer_splits = stratified_group_k_fold(None, target_accuracy_group, installation_ids, n_outer_splits, seed=2019)
+    for (train_split, test_split) in outer_splits:
+        X_train = df_train.iloc[train_split, :]
+        X_test = df_train.iloc[test_split, :]
+
+        train_split_accuracy_group = target_accuracy_group[train_split]
+        train_split_correct_attempts = target_correct_attempts[train_split]
+        train_split_uncorrect_attempts = target_uncorrect_attempts[train_split]
+        train_split_installation_ids = installation_ids.iloc[train_split]
+
+        test_split_accuracy_group = target_accuracy_group[test_split]
+
+        oof_train_predictions = np.zeros((X_train.shape[0], 4 + 2 + 1))
+        test_prediction = np.zeros((X_test.shape[0], 4 + 2 + 1))
+
+        inner_splits = stratified_group_k_fold(
+            None, train_split_accuracy_group, train_split_installation_ids, n_inner_splits, seed=2019
+        )
+        for (inner_train_split, inner_test_split) in inner_splits:
+            inner_test_split_prediction, holdout_prediction = \
+                predict(X_train, train_split_accuracy_group, train_split_correct_attempts,
+                        train_split_uncorrect_attempts, inner_train_split, inner_test_split, X_test, models_specs)
+
+            oof_train_predictions[inner_test_split, :] = inner_test_split_prediction
+            test_prediction += (holdout_prediction / n_inner_splits)
+
+        ss = StandardScaler()
+        meta_clf = LogisticRegression(multi_class='multinomial', solver='lbfgs', n_jobs=-1, max_iter=300)
+        meta_clf.fit(ss.fit_transform(oof_train_predictions), train_split_accuracy_group)
+        meta_prediction = meta_clf.predict(ss.transform(test_prediction))
+        oof_predictions[test_split] = meta_prediction
+
+        score = cohen_kappa_score(test_split_accuracy_group, meta_prediction, weights='quadratic')
+        print('Done fold. Score:', score)
+
+    score = cohen_kappa_score(target_accuracy_group, oof_predictions, weights='quadratic')
+    print(score)
+    return score
 
 
 def bayes_opt(fn, params, probes=None):
@@ -149,7 +225,7 @@ def bayes_opt(fn, params, probes=None):
         for probe in probes:
             opt.probe(params=probe, lazy=True)
 
-    opt.maximize(n_iter=200, init_points=5)
+    opt.maximize(n_iter=200, init_points=60)
     print(opt.max)
 
 
@@ -159,80 +235,34 @@ if __name__ == '__main__':
     bayes_opt(
         lgb_multi_model_eval,
         {
-            'clf_correct_attempts:learning_rate': (0.01, 1.0),
-            'clf_correct_attempts:max_depth': (3, 10),
-            'clf_correct_attempts:max_bin': (2, 500),
-            'clf_correct_attempts:num_leaves': (5, 500),
-            'clf_correct_attempts:min_child_samples': (50, 1500),
-            'clf_correct_attempts:min_child_weight': (0.1, 1000),
-            'clf_correct_attempts:colsample_bytree': (0.05, 0.6),
-            'clf_correct_attempts:reg_alpha': (0.1, 30),
-            'clf_correct_attempts:reg_lambda': (0.1, 30),
+            'accuracy_group:learning_rate': (0.01, 1.0),
+            'accuracy_group:max_depth': (3, 8),
+            'accuracy_group:max_bin': (2, 255),
+            'accuracy_group:num_leaves': (5, 500),
+            'accuracy_group:min_child_samples': (50, 1500),
+            'accuracy_group:min_child_weight': (0.1, 1000),
+            'accuracy_group:colsample_bytree': (0.1, 0.6),
+            'accuracy_group:reg_alpha': (0.1, 30),
+            'accuracy_group:reg_lambda': (0.1, 30),
 
-            'reg_uncorrect_attempts:learning_rate': (0.01, 1.0),
-            'reg_uncorrect_attempts:max_depth': (3, 10),
-            'reg_uncorrect_attempts:max_bin': (2, 500),
-            'reg_uncorrect_attempts:num_leaves': (5, 500),
-            'reg_uncorrect_attempts:min_child_samples': (50, 1500),
-            'reg_uncorrect_attempts:min_child_weight': (0.1, 1000),
-            'reg_uncorrect_attempts:colsample_bytree': (0.05, 0.6),
-            'reg_uncorrect_attempts:reg_alpha': (0.1, 30),
-            'reg_uncorrect_attempts:reg_lambda': (0.1, 30),
-        },
-        probes=[
-            {"clf_correct_attempts:colsample_bytree": 0.10334767151552683,
-             "clf_correct_attempts:learning_rate": 0.029891107644305845,
-             "clf_correct_attempts:max_bin": 403.63597687481536,
-             "clf_correct_attempts:max_depth": 7.630901866600385,
-             "clf_correct_attempts:min_child_samples": 867.6192673961293,
-             "clf_correct_attempts:min_child_weight": 160.84184939114124,
-             "clf_correct_attempts:num_leaves": 407.630333559809,
-             "clf_correct_attempts:reg_alpha": 15.807080783827528,
-             "clf_correct_attempts:reg_lambda": 10.109721556430491,
-             "reg_uncorrect_attempts:colsample_bytree": 0.3885796025348852,
-             "reg_uncorrect_attempts:learning_rate": 0.09146678093888543,
-             "reg_uncorrect_attempts:max_bin": 298.03316385733507,
-             "reg_uncorrect_attempts:max_depth": 7.439908933764865,
-             "reg_uncorrect_attempts:min_child_samples": 274.88036337243125,
-             "reg_uncorrect_attempts:min_child_weight": 361.1130703470717,
-             "reg_uncorrect_attempts:num_leaves": 317.361765580482,
-             "reg_uncorrect_attempts:reg_alpha": 5.2603473767855515,
-             "reg_uncorrect_attempts:reg_lambda": 28.75196606940299},
-            {"clf_correct_attempts:colsample_bytree": 0.7479871340435861,
-             "clf_correct_attempts:learning_rate": 0.16420226500237103,
-             "clf_correct_attempts:max_bin": 478.9454982979397,
-             "clf_correct_attempts:max_depth": 7.074141701427287,
-             "clf_correct_attempts:min_child_samples": 160.65491022582302,
-             "clf_correct_attempts:min_child_weight": 22.407785965651843,
-             "clf_correct_attempts:num_leaves": 265.60671862673746,
-             "clf_correct_attempts:reg_alpha": 29.848926681241593,
-             "clf_correct_attempts:reg_lambda": 27.132113615450297,
-             "reg_uncorrect_attempts:colsample_bytree": 0.47037170385250415,
-             "reg_uncorrect_attempts:learning_rate": 0.012162585925199094,
-             "reg_uncorrect_attempts:max_bin": 25.980553497754865,
-             "reg_uncorrect_attempts:max_depth": 5.786974861042519,
-             "reg_uncorrect_attempts:min_child_samples": 1463.1282815050479,
-             "reg_uncorrect_attempts:min_child_weight": 131.64426437899147,
-             "reg_uncorrect_attempts:num_leaves": 471.97671065831497,
-             "reg_uncorrect_attempts:reg_alpha": 12.371956179828944,
-             "reg_uncorrect_attempts:reg_lambda": 19.2948688659447},
-            {"clf_correct_attempts:colsample_bytree": 0.1248098023982449,
-             "clf_correct_attempts:learning_rate": 0.10342583432650229,
-             "clf_correct_attempts:max_bin": 187.14525960895386,
-             "clf_correct_attempts:max_depth": 4.758365045540807,
-             "clf_correct_attempts:min_child_samples": 235.51063646456035,
-             "clf_correct_attempts:min_child_weight": 7.445893668578389,
-             "clf_correct_attempts:num_leaves": 193.04674974320685,
-             "clf_correct_attempts:reg_alpha": 12.398553150143126,
-             "clf_correct_attempts:reg_lambda": 24.496136535125633,
-             "reg_uncorrect_attempts:colsample_bytree": 0.3903008048793679,
-             "reg_uncorrect_attempts:learning_rate": 0.15882978384614804,
-             "reg_uncorrect_attempts:max_bin": 351.9710071636617,
-             "reg_uncorrect_attempts:max_depth": 9.379019489701598,
-             "reg_uncorrect_attempts:min_child_samples": 1304.882469005186,
-             "reg_uncorrect_attempts:min_child_weight": 498.0164877147689,
-             "reg_uncorrect_attempts:num_leaves": 16.041409064329585,
-             "reg_uncorrect_attempts:reg_alpha": 2.5843001310082196,
-             "reg_uncorrect_attempts:reg_lambda": 18.35238370653897},
-        ]
+            'correct_attempts:learning_rate': (0.01, 1.0),
+            'correct_attempts:max_depth': (3, 8),
+            'correct_attempts:max_bin': (2, 255),
+            'correct_attempts:num_leaves': (5, 500),
+            'correct_attempts:min_child_samples': (50, 1500),
+            'correct_attempts:min_child_weight': (0.1, 1000),
+            'correct_attempts:colsample_bytree': (0.1, 0.6),
+            'correct_attempts:reg_alpha': (0.1, 30),
+            'correct_attempts:reg_lambda': (0.1, 30),
+
+            'uncorrect_attempts:learning_rate': (0.01, 1.0),
+            'uncorrect_attempts:max_depth': (3, 8),
+            'uncorrect_attempts:max_bin': (2, 255),
+            'uncorrect_attempts:num_leaves': (5, 500),
+            'uncorrect_attempts:min_child_samples': (50, 1500),
+            'uncorrect_attempts:min_child_weight': (0.1, 1000),
+            'uncorrect_attempts:colsample_bytree': (0.1, 0.6),
+            'uncorrect_attempts:reg_alpha': (0.1, 30),
+            'uncorrect_attempts:reg_lambda': (0.1, 30),
+        }
     )

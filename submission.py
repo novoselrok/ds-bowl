@@ -582,10 +582,10 @@ def stratified_group_k_fold(X, y, groups, k, seed=None):
         yield train_indices, test_indices
 
 
-def get_correct_attempts_clf(model_params):
+def get_correct_attempts_model(model_params, n_estimators=5000):
     return LGBMClassifier(
         random_state=2019,
-        n_estimators=5000,
+        n_estimators=n_estimators,
         n_jobs=-1,
         objective='binary',
         metric='binary_logloss',
@@ -593,21 +593,32 @@ def get_correct_attempts_clf(model_params):
     )
 
 
-def get_uncorrect_attempts_reg(model_params):
+def get_uncorrect_attempts_model(model_params, n_estimators=5000):
     return LGBMRegressor(
         random_state=2019,
-        n_estimators=5000,
+        n_estimators=n_estimators,
         n_jobs=-1,
         **model_params
     )
 
 
-def fit_model(model, x_train, y_train, x_val, y_val):
+def get_accuracy_group_model(model_params, n_estimators=5000):
+    return LGBMClassifier(
+        random_state=2019,
+        n_estimators=n_estimators,
+        n_jobs=-1,
+        objective='multiclass',
+        metric='multi_logloss',
+        **model_params
+    )
+
+
+def fit_model(model, X_train, y_train, X_val, y_val, early_stopping_rounds=100, verbose=0):
     model.fit(
-        x_train, y_train,
-        early_stopping_rounds=100,
-        eval_set=[(x_val, y_val)],
-        verbose=0,
+        X_train, y_train,
+        early_stopping_rounds=early_stopping_rounds,
+        eval_set=[(X_val, y_val)],
+        verbose=verbose,
     )
 
 
@@ -645,8 +656,8 @@ def output_submission():
             y_correct_train, y_correct_val = y_correct[train_split], y_correct[test_split]
             y_uncorrect_train, y_uncorrect_val = y_uncorrect[train_split], y_uncorrect[test_split]
 
-            correct_attempts_clf = get_correct_attempts_clf(clf_correct_attempts_params)
-            uncorrect_attempts_reg = get_uncorrect_attempts_reg(reg_uncorrect_attempts_params)
+            correct_attempts_clf = get_correct_attempts_model(clf_correct_attempts_params)
+            uncorrect_attempts_reg = get_uncorrect_attempts_model(reg_uncorrect_attempts_params)
 
             fit_model(correct_attempts_clf, x_train, y_correct_train, x_val, y_correct_val)
             fit_model(uncorrect_attempts_reg, x_train, y_uncorrect_train, x_val, y_uncorrect_val)

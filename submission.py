@@ -4,6 +4,7 @@ import math
 import os
 import gc
 import random
+import time
 from collections import defaultdict, Counter
 from functools import partial
 
@@ -13,128 +14,6 @@ import scipy.optimize
 from lightgbm import LGBMClassifier, LGBMRegressor
 from sklearn.metrics import cohen_kappa_score, roc_auc_score, mean_squared_error
 from sklearn.preprocessing import LabelEncoder
-
-important_event_ids = {'05ad839b',
-                       '08ff79ad',
-                       '0d18d96c',
-                       '0db6d71d',
-                       '1325467d',
-                       '15a43e5b',
-                       '19967db1',
-                       '222660ff',
-                       '2230fab4',
-                       '250513af',
-                       '262136f4',
-                       '28a4eb9a',
-                       '28f975ea',
-                       '2b058fe3',
-                       '2dc29e21',
-                       '30614231',
-                       '31973d56',
-                       '3393b68b',
-                       '363c86c9',
-                       '37937459',
-                       '3afb49e6',
-                       '3afde5dd',
-                       '3bb91dda',
-                       '3bf1cf26',
-                       '3d63345e',
-                       '3ddc79c3',
-                       '3edf6747',
-                       '3ee399c3',
-                       '45d01abe',
-                       '461eace6',
-                       '47026d5f',
-                       '47efca07',
-                       '47f43a44',
-                       '499edb7c',
-                       '4bb2f698',
-                       '4e5fc6f5',
-                       '4ef8cdd3',
-                       '5290eab1',
-                       '565a3990',
-                       '5859dfb6',
-                       '587b5989',
-                       '5c2f29ca',
-                       '5c3d2b2f',
-                       '5e3ea25a',
-                       '5f0eb72c',
-                       '6043a2b4',
-                       '67aa2ada',
-                       '6aeafed4',
-                       '6c517a88',
-                       '6f4adc4b',
-                       '6f4bd64e',
-                       '6f8106d9',
-                       '731c0cbe',
-                       '7372e1a5',
-                       '73757a5e',
-                       '74e5f8a7',
-                       '76babcde',
-                       '77c76bc5',
-                       '77ead60d',
-                       '7da34a02',
-                       '7dfe6d8a',
-                       '804ee27f',
-                       '84538528',
-                       '85d1b0de',
-                       '86c924c4',
-                       '884228c8',
-                       '88d4a5be',
-                       '89aace00',
-                       '8af75982',
-                       '8b757ab8',
-                       '8d748b58',
-                       '8fee50e2',
-                       '90efca10',
-                       '92687c59',
-                       '93edfe2e',
-                       '9b4001e4',
-                       '9ce586dd',
-                       '9d29771f',
-                       '9e34ea74',
-                       'a0faea5d',
-                       'a16a373e',
-                       'a2df0760',
-                       'a44b10dc',
-                       'a5be6304',
-                       'a7640a16',
-                       'a8876db3',
-                       'ac92046e',
-                       'acf5c23f',
-                       'b2e5b0f1',
-                       'bc8f2793',
-                       'bcceccc6',
-                       'bd612267',
-                       'c0415e5c',
-                       'c51d8688',
-                       'c58186bf',
-                       'c7fe2a55',
-                       'c952eb01',
-                       'cb1178ad',
-                       'cdd22e43',
-                       'cf82af56',
-                       'd02b7a8e',
-                       'd185d3ea',
-                       'd2e9262e',
-                       'd3268efa',
-                       'd3640339',
-                       'd38c2fd7',
-                       'd3f1e122',
-                       'd45ed6a1',
-                       'daac11b0',
-                       'de26c3a6',
-                       'df4fe8b6',
-                       'e04fb33d',
-                       'e080a381',
-                       'e37a2b78',
-                       'e3ff61fb',
-                       'e57dd7af',
-                       'e694a35b',
-                       'e7e44842',
-                       'eb2c19cd',
-                       'f3cd5473',
-                       'f54238ee'}
 
 BIRD_MEASURER_ASSESSMENT = 'Bird Measurer (Assessment)'
 LGB_INTEGER_PARAMS = ['max_depth', 'max_bin', 'num_leaves', 'min_child_samples', 'n_splits', 'subsample_freq']
@@ -150,8 +29,9 @@ def preprocess_events():
 
     def _postprocessing(game_sessions):
         for idx in range(len(game_sessions)):
-            event_codes = game_sessions[idx]['event_codes']
-            event_ids = game_sessions[idx]['event_ids']
+            event_codes = dict(game_sessions[idx]['event_codes'])
+            event_ids = dict(game_sessions[idx]['event_ids'])
+            event_data_props = dict(game_sessions[idx]['event_data_props'])
             game_time = np.max(game_sessions[idx]['game_times'])
             game_times_sorted = np.array(list(sorted(game_sessions[idx]['game_times'])))
 
@@ -165,6 +45,8 @@ def preprocess_events():
 
             del game_sessions[idx]['game_times']
             del game_sessions[idx]['event_codes']
+            del game_sessions[idx]['event_ids']
+            del game_sessions[idx]['event_data_props']
 
             correct, uncorrect = game_sessions[idx]['correct_attempts'], game_sessions[idx]['uncorrect_attempts']
             if correct == 0 and uncorrect == 0:
@@ -185,8 +67,9 @@ def preprocess_events():
 
             game_sessions[idx] = {
                 **game_sessions[idx],
-                **dict(event_codes),
-                **dict(event_ids),
+                **event_codes,
+                **event_ids,
+                **event_data_props,
                 'game_time': game_time,
                 'game_time_mean_diff': game_time_mean_diff,
                 'game_time_std_diff': game_time_std_diff,
@@ -217,7 +100,7 @@ def preprocess_events():
                         'world': row['world'],
                         'event_codes': defaultdict(int),
                         'event_ids': defaultdict(int),
-                        # 'event_data_props': defaultdict(int)
+                        'event_data_props': defaultdict(float)
                     }
 
                 game_session = game_sessions[row['game_session']]
@@ -228,7 +111,7 @@ def preprocess_events():
                 event_data = json.loads(row['event_data'])
                 event_code = int(row['event_code'])
 
-                game_session['event_codes'][f'cnt_event_code_{event_code}'] += 1
+                game_session['event_codes'][f'event_code_{event_code}'] += 1
 
                 is_assessment = row['type'] == 'Assessment'
                 if is_assessment:
@@ -247,8 +130,9 @@ def preprocess_events():
                             game_session['uncorrect_attempts'] += 1
 
                 event_id = row['event_id']
-                if event_id in important_event_ids:
-                    game_session['event_ids'][f'cnt_event_id_{event_id}'] += 1
+                game_session['event_ids'][f'event_id_{event_id}'] += 1
+                for prop in event_ids_to_props[event_id]:
+                    game_session['event_data_props'][f'event_data_prop_{event_id}_{prop}'] += event_data[prop]
 
                 if idx % 10000 == 0:
                     print(idx)
@@ -299,9 +183,25 @@ def feature_engineering():
     def _compute_features(df_data, prefix, df_assessments):
         game_sessions = []
 
+        event_codes_columns = [column for column in df_data.columns if column.startswith('event_code')]
+        event_data_props_columns = [column for column in df_data.columns if column.startswith('event_data_prop')]
+        event_ids_columns = [column for column in df_data.columns if column.startswith('event_id')]
+
         df_assessments = df_assessments.sort_values(by='installation_id')
         installation_id_to_game_sessions = dict(tuple(df_data.groupby('installation_id')))
 
+        _aggregate_game_sessions_columns = {
+            **aggregate_game_sessions_columns,
+            **aggregate_assessment_game_session_columns,
+            **{column: ['std', 'mean', 'median', 'max']
+               for column in event_codes_columns + event_data_props_columns + event_ids_columns}
+        }
+
+        total_time = time.time()
+        times = {
+            'agg1': 0,
+            'agg2': 0,
+        }
         total_assessments = df_assessments.shape[0]
         for idx, assessment in df_assessments.iterrows():
             installation_id = assessment['installation_id']
@@ -313,104 +213,69 @@ def feature_engineering():
                 game_sessions_for_installation_id['timestamp'] < start_timestamp
                 ].copy(deep=True)
 
+            assessment_info = pd.DataFrame({
+                'installation_id': installation_id,
+                'assessment_game_session': assessment['game_session'],
+                'assessment_title': assessment['title'],
+                'assessment_world': assessment['world'],
+                'assessment_most_common_title_accuracy_group': assessment[
+                    'assessment_most_common_title_accuracy_group'],
+                'assessment_dayofweek': assessment['assessment_dayofweek'],
+                'assessment_hour': assessment['assessment_hour'],
+            }, index=[0])
+
             if previous_game_sessions.shape[0] == 0:
-                game_sessions.append(
-                    pd.DataFrame({
-                        'title': '__no_title',
-                        'type': '__no_type',
-                        'world': '__no_world',
-                        'installation_id': installation_id,
-                        'assessment_game_session': assessment['game_session'],
-                        'assessment_title': assessment['title'],
-                        'assessment_world': assessment['world'],
-                        'assessment_most_common_title_accuracy_group': assessment[
-                            'assessment_most_common_title_accuracy_group'],
-                        'assessment_dayofweek': assessment['assessment_dayofweek'],
-                        'assessment_hour': assessment['assessment_hour'],
-                    }, index=[0])
-                )
+                game_sessions.append(assessment_info)
                 continue
 
+            agg1 = time.time()
             # Previous attempts for current assessment
             # Which attempt, accuracy groups for current assessment, correct/incorrect/rate attempts
-            previous_attempts_agg = previous_game_sessions[
-                previous_game_sessions['title'] == assessment['title']
-                ].agg(aggregate_assessment_game_session_columns).reset_index()
+            previous_game_session_attempts = previous_game_sessions[
+                previous_game_sessions['title'] == assessment['title']]
 
-            for _, row in previous_attempts_agg.iterrows():
-                for column in aggregate_assessment_game_session_columns.keys():
-                    previous_game_sessions[f'assessment_previous_{column}_{row["index"]}'] = row[column]
+            previous_game_session_attempts_agg = previous_game_session_attempts \
+                .groupby('installation_id') \
+                .agg(aggregate_assessment_game_session_columns).reset_index(drop=True)
+            previous_game_session_attempts_agg.columns = [
+                'previous_assessment_attempt_' + _get_aggregated_column_name(column)
+                for column in previous_game_session_attempts_agg.columns
+            ]
+            times['agg1'] += (time.time() - agg1)
 
-            # Everything with the assessment_* prefix is related to
-            # the assessment we are predicting the accuracy_group for.
-            # Everything else is aggregated from game sessions that happened before the assessment.
-            previous_game_sessions['installation_id'] = installation_id
+            agg2 = time.time()
+            # One-hot-encode categorical features
+            previous_game_sessions = pd.get_dummies(
+                previous_game_sessions, columns=['title', 'type', 'world'], prefix='ohe')
+            ohe_columns_agg = {column: 'sum' for column in previous_game_sessions.columns if column.startswith('ohe')}
 
-            copy_from_assessment = {
-                'game_session': 'assessment_game_session',
-                'assessment_most_common_title_accuracy_group': 'assessment_most_common_title_accuracy_group',
-                'assessment_dayofweek': 'assessment_dayofweek',
-                'assessment_hour': 'assessment_hour',
-                'title': 'assessment_title',
-                'world': 'assessment_world'
-            }
-            for k, v in copy_from_assessment.items():
-                previous_game_sessions[v] = assessment[k]
+            previous_game_sessions_agg = previous_game_sessions \
+                .groupby('installation_id') \
+                .agg({**_aggregate_game_sessions_columns, **ohe_columns_agg}).reset_index(drop=True)
+            previous_game_sessions_agg.columns = [
+                _get_aggregated_column_name(column) for column in previous_game_sessions_agg.columns
+            ]
+            times['agg2'] += (time.time() - agg2)
 
-            game_sessions.append(previous_game_sessions)
+            df_final_agg = pd.concat(
+                (assessment_info, previous_game_sessions_agg, previous_game_session_attempts_agg),
+                axis=1
+            )
 
-            # if idx == 100:
-            #     break
+            game_sessions.append(df_final_agg)
+
+            if idx == 10:
+                break
 
             if idx % 100 == 0:
                 print(f'Row {idx + 1}/{total_assessments} done')
 
+        print("Total time ", time.time() - total_time)
+        print(times)
+
         df_final = pd.concat(game_sessions, ignore_index=True, sort=False)
-        assessment_game_sessions = df_final['type'] == 'Assessment'
-        df_final = pd.get_dummies(df_final, columns=['title', 'type', 'world'], prefix='ttw')
-
-        _agg_cols = {
-            **aggregate_game_sessions_columns,
-
-            **{column: 'first'
-               for column in df_final.columns
-               if column.startswith('assessment') and column != 'assessment_game_session'},
-
-            **{column: ['std', 'mean', 'median', 'max']
-               for column in df_final.columns if column.startswith('cnt')},
-
-            # Sum dummy columns (ttw_(title*), etc.)
-            **{column: 'sum'
-               for column in df_final.columns if column.startswith('ttw')}
-        }
-
-        df_final_aggregated = df_final[['installation_id', 'assessment_game_session', *_agg_cols.keys()]] \
-            .groupby(['installation_id', 'assessment_game_session']) \
-            .agg(_agg_cols) \
-            .reset_index()
-
-        df_final_assessments_aggregated = df_final[assessment_game_sessions] \
-            [['installation_id', 'assessment_game_session', *aggregate_assessment_game_session_columns.keys()]] \
-            .groupby(['installation_id', 'assessment_game_session']) \
-            .agg(aggregate_assessment_game_session_columns) \
-            .reset_index()
-
-        df_final_aggregated.columns = [
-            _get_aggregated_column_name(column) for column in df_final_aggregated.columns
-        ]
-
-        df_final_assessments_aggregated.columns = [
-            _get_aggregated_column_name(column) for column in df_final_assessments_aggregated.columns
-        ]
-
-        df_final_aggregated = df_final_aggregated.merge(
-            df_final_assessments_aggregated,
-            on=['installation_id', 'assessment_game_session'],
-            how='left'
-        )
-
         print('Writing features...')
-        df_final_aggregated.to_csv(f'preprocessed-data/{prefix}_features.csv', index=False)
+        df_final.to_csv(f'preprocessed-data/{prefix}_features.csv', index=False)
 
     aggregate_game_sessions_columns = {
         'game_time': ['std', 'mean', 'median', 'max'],
@@ -1040,4 +905,4 @@ EVENT_PROPS_JSON = 'event_props.json'
 CORRELATED_FEATURES_JSON = 'correlated_features.json'
 FEATURE_IMPORTANCES_CSV = 'feature_importances.csv'
 
-output_submission()
+feature_engineering()

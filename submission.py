@@ -4,7 +4,6 @@ import math
 import os
 import gc
 import random
-import time
 from collections import defaultdict, Counter
 from functools import partial
 
@@ -57,13 +56,13 @@ def preprocess_events():
             if correct == 0 and uncorrect == 0:
                 pass
             elif correct == 1 and uncorrect == 0:
-                game_sessions[idx]['accuracy_group_3'] = 1
+                game_sessions[idx]['accuracy_group'] = 3
             elif correct == 1 and uncorrect == 1:
-                game_sessions[idx]['accuracy_group_2'] = 1
+                game_sessions[idx]['accuracy_group'] = 2
             elif correct == 1 and uncorrect >= 2:
-                game_sessions[idx]['accuracy_group_1'] = 1
+                game_sessions[idx]['accuracy_group'] = 1
             else:
-                game_sessions[idx]['accuracy_group_0'] = 1
+                game_sessions[idx]['accuracy_group'] = 0
 
             game_sessions[idx] = {
                 **game_sessions[idx],
@@ -137,7 +136,7 @@ def preprocess_events():
                 if idx % 10000 == 0:
                     print(idx)
 
-        df_data = fillna0(pd.DataFrame(_postprocessing(list(game_sessions.values()))))
+        df_data = pd.DataFrame(_postprocessing(list(game_sessions.values())))
         df_data.to_csv(f'preprocessed-data/{prefix}_game_sessions.csv', index=False)
 
     os.makedirs('preprocessed-data', exist_ok=True)
@@ -165,6 +164,8 @@ def preprocess_events():
 
 
 def feature_engineering():
+    aggfns = {'std': np.std, 'mean': np.mean, 'max': np.max}
+
     def _add_time_features(df):
         timestamp = pd.to_datetime(df['timestamp'])
         df['timestamp'] = (timestamp.astype(int) / 10 ** 9).astype(int)
@@ -180,6 +181,19 @@ def feature_engineering():
 
         return '_'.join(column)
 
+    def _agg_game_sessions(values, columns, prefix=''):
+        agg_columns = []
+        agg = []
+        for name, aggfn in aggfns.items():
+            agg_columns.extend(
+                [f'{prefix}{column}_{name}' for column in columns]
+            )
+            agg.append(
+                aggfn(values, axis=0).reshape(1, -1)
+            )
+
+        return pd.DataFrame(np.concatenate(agg, axis=1), columns=agg_columns)
+
     def _compute_features(df_data, prefix, df_assessments):
         game_sessions = []
 
@@ -190,18 +204,10 @@ def feature_engineering():
         df_assessments = df_assessments.sort_values(by='installation_id')
         installation_id_to_game_sessions = dict(tuple(df_data.groupby('installation_id')))
 
-        _aggregate_game_sessions_columns = {
-            **aggregate_game_sessions_columns,
-            **aggregate_assessment_game_session_columns,
-            **{column: ['std', 'mean', 'median', 'max']
-               for column in event_codes_columns + event_data_props_columns + event_ids_columns}
-        }
+        _aggregate_game_sessions_columns = (aggregate_game_sessions_columns +
+                                            aggregate_assessment_game_session_columns +
+                                            event_codes_columns + event_data_props_columns + event_ids_columns)
 
-        total_time = time.time()
-        times = {
-            'agg1': 0,
-            'agg2': 0,
-        }
         total_assessments = df_assessments.shape[0]
         for idx, assessment in df_assessments.iterrows():
             installation_id = assessment['installation_id']
@@ -228,67 +234,61 @@ def feature_engineering():
                 game_sessions.append(assessment_info)
                 continue
 
-            agg1 = time.time()
             # Previous attempts for current assessment
             # Which attempt, accuracy groups for current assessment, correct/incorrect/rate attempts
-            previous_game_session_attempts = previous_game_sessions[
-                previous_game_sessions['title'] == assessment['title']]
+            previous_attempts_game_sessions_values = previous_game_sessions[
+                previous_game_sessions['title'] == assessment['title']
+                ][aggregate_assessment_game_session_columns].values
 
-            previous_game_session_attempts_agg = previous_game_session_attempts \
-                .groupby('installation_id') \
-                .agg(aggregate_assessment_game_session_columns).reset_index(drop=True)
-            previous_game_session_attempts_agg.columns = [
-                'previous_assessment_attempt_' + _get_aggregated_column_name(column)
-                for column in previous_game_session_attempts_agg.columns
-            ]
-            times['agg1'] += (time.time() - agg1)
+            if previous_attempts_game_sessions_values.shape[0] > 0:
+                previous_game_session_attempts_agg = _agg_game_sessions(
+                    previous_attempts_game_sessions_values, aggregate_assessment_game_session_columns,
+                    prefix='previous_assessment_attempt_'
+                )
+            else:
+                previous_game_session_attempts_agg = pd.DataFrame()
 
-            agg2 = time.time()
             # One-hot-encode categorical features
             previous_game_sessions = pd.get_dummies(
                 previous_game_sessions, columns=['title', 'type', 'world'], prefix='ohe')
-            ohe_columns_agg = {column: 'sum' for column in previous_game_sessions.columns if column.startswith('ohe')}
+            ohe_columns = [column for column in previous_game_sessions.columns if column.startswith('ohe')]
+            ohe_agg = pd.DataFrame(
+                np.sum(previous_game_sessions[ohe_columns].values, axis=0).reshape(1, -1), columns=ohe_columns)
 
-            previous_game_sessions_agg = previous_game_sessions \
-                .groupby('installation_id') \
-                .agg({**_aggregate_game_sessions_columns, **ohe_columns_agg}).reset_index(drop=True)
-            previous_game_sessions_agg.columns = [
-                _get_aggregated_column_name(column) for column in previous_game_sessions_agg.columns
-            ]
-            times['agg2'] += (time.time() - agg2)
+            previous_game_sessions_values = previous_game_sessions[_aggregate_game_sessions_columns].values
+            previous_game_sessions_agg = _agg_game_sessions(
+                previous_game_sessions_values, _aggregate_game_sessions_columns)
 
             df_final_agg = pd.concat(
-                (assessment_info, previous_game_sessions_agg, previous_game_session_attempts_agg),
+                (assessment_info, previous_game_sessions_agg, ohe_agg, previous_game_session_attempts_agg),
                 axis=1
             )
 
             game_sessions.append(df_final_agg)
 
-            if idx == 10:
-                break
+            # if idx == 10:
+            #     break
 
             if idx % 100 == 0:
                 print(f'Row {idx + 1}/{total_assessments} done')
-
-        print("Total time ", time.time() - total_time)
-        print(times)
 
         df_final = pd.concat(game_sessions, ignore_index=True, sort=False)
         print('Writing features...')
         df_final.to_csv(f'preprocessed-data/{prefix}_features.csv', index=False)
 
-    aggregate_game_sessions_columns = {
-        'game_time': ['std', 'mean', 'median', 'max'],
-        'event_count': ['std', 'mean', 'median', 'max'],
-        'game_time_mean_diff': ['std', 'mean', 'median', 'max'],
-        'game_time_std_diff': ['std', 'mean', 'median', 'max'],
-    }
+    aggregate_game_sessions_columns = [
+        'game_time',
+        'event_count',
+        'game_time_mean_diff',
+        'game_time_std_diff',
+    ]
 
-    aggregate_assessment_game_session_columns = {
-        'correct_attempts': ['std', 'mean', 'median', 'max'],
-        'uncorrect_attempts': ['std', 'mean', 'median', 'max'],
-        'accuracy_rate': ['std', 'mean', 'median', 'max'],
-    }
+    aggregate_assessment_game_session_columns = [
+        'correct_attempts',
+        'uncorrect_attempts',
+        'accuracy_rate',
+        'accuracy_group',
+    ]
 
     df_train_labels = pd.read_csv(TRAIN_LABELS_CSV)
     # Add most common title accuracy group to assessment
@@ -390,8 +390,13 @@ def get_train_test_features():
     df_train_features = df_train_features.drop(
         columns=columns_to_drop + ['num_correct', 'num_incorrect', 'accuracy', 'accuracy_group']
     )
+    df_train_features_columns = set(df_train_features.columns)
+    df_test_features_columns = set(df_test_features.columns)
+    columns = df_train_features_columns & df_test_features_columns
+
     # Make sure test columns are in the correct order
-    df_test_features = df_test_features.drop(columns=columns_to_drop)[df_train_features.columns]
+    df_train_features = df_train_features[columns]
+    df_test_features = df_test_features.drop(columns=columns_to_drop)[columns]
 
     return (
         df_train_features,
@@ -672,35 +677,6 @@ def fit_predict_ordinal_model(params):
             test_accuracy_group_proba.argmax(axis=1).reshape(-1, 1))
 
 
-def fit_predict_accuracy_group_classification_model(params):
-    (
-        df_train_features,
-        df_test_features,
-        _,
-        _,
-        _,
-        y_accuracy_group,
-        train_installation_ids,
-        _
-    ) = get_train_test_features()
-
-    df_train, df_test = label_encode_categorical_features(df_train_features, df_test_features)
-    model_params = integer_encode_params(params)
-
-    return cv_with_oof_predictions(
-        get_lgbm_classifier('multiclass', 'multi_logloss'),
-        lambda y_true, y_pred: cohen_kappa_score(y_true, y_pred, weights='quadratic'),
-        df_train,
-        df_test,
-        y_accuracy_group,
-        y_accuracy_group,
-        train_installation_ids,
-        model_params,
-        predict_proba=False,
-        n_predicted_features=1
-    )
-
-
 class OptimizedRounder(object):
     def __init__(self, initial_coef, labels):
         self.coef_ = 0
@@ -815,8 +791,6 @@ def output_submission():
                 base_features.append(fit_predict_accuracy_rate_regression_model(model_desc['params']))
             elif model_desc['name'] == 'accuracy_group_ordinal':
                 base_features.append(fit_predict_ordinal_model(model_desc['params']))
-            elif model_desc['name'] == 'accuracy_group_classification':
-                base_features.append(fit_predict_accuracy_group_classification_model(model_desc['params']))
 
         meta_train_features = np.concatenate([_train for (_train, _) in base_features], axis=1)
         meta_test_features = np.concatenate([_test for (_, _test) in base_features], axis=1)
@@ -904,5 +878,3 @@ TRAIN_FEATURES_CSV = 'preprocessed-data/train_features.csv'
 EVENT_PROPS_JSON = 'event_props.json'
 CORRELATED_FEATURES_JSON = 'correlated_features.json'
 FEATURE_IMPORTANCES_CSV = 'feature_importances.csv'
-
-feature_engineering()

@@ -1,7 +1,6 @@
 import math
 import os
 
-import pandas as pd
 import numpy as np
 from bayes_opt import BayesianOptimization, JSONLogger, Events
 from bayes_opt.util import load_logs
@@ -205,11 +204,11 @@ def bayes_opt(fn, name, params, probes=None):
 
 
 def main():
-    CV_ACCURACY_GROUP_CLASSIFICATION = False
-    CV_ORDINAL_CLASSIFICATION = False
+    CV_ACCURACY_GROUP_CLASSIFICATION = True
+    CV_ORDINAL_CLASSIFICATION = True
     CV_CORRECT_ATTEMPTS = True
     CV_ACCURACY_GROUP_REGRESSION = True
-    CV_ACCURACY_RATE_REGRESSION = False
+    CV_ACCURACY_RATE_REGRESSION = True
 
     lgb_bayes_params = {
         'learning_rate': (0.01, 1.0),
@@ -224,6 +223,9 @@ def main():
         'reg_lambda': (1, 30),
     }
 
+    if CV_CORRECT_ATTEMPTS:
+        bayes_opt(cv_correct_attempts, 'cv_correct_attempts', lgb_bayes_params)
+
     if CV_ACCURACY_GROUP_CLASSIFICATION:
         bayes_opt(cv_accuracy_group_classification, 'cv_accuracy_group_classification', lgb_bayes_params)
 
@@ -234,9 +236,6 @@ def main():
 
     if CV_ACCURACY_RATE_REGRESSION:
         bayes_opt(cv_accuracy_rate_regression, 'cv_accuracy_rate_regression', lgb_bayes_params)
-
-    if CV_CORRECT_ATTEMPTS:
-        bayes_opt(cv_correct_attempts, 'cv_correct_attempts', lgb_bayes_params)
 
     if CV_ACCURACY_GROUP_REGRESSION:
         bayes_opt(cv_accuracy_group_regression, 'cv_accuracy_group_regression', lgb_bayes_params)

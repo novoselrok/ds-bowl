@@ -11,10 +11,11 @@ import pandas as pd
 import numpy as np
 import scipy.optimize
 from catboost import CatBoostClassifier, CatBoostRegressor
-from lightgbm import LGBMClassifier, LGBMRegressor, plot_importance
+from lightgbm import LGBMClassifier, LGBMRegressor
+from sklearn.linear_model import ElasticNet
 from sklearn.metrics import cohen_kappa_score, roc_auc_score, mean_squared_error
-from sklearn.preprocessing import LabelEncoder
-import matplotlib.pyplot as plt
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from xgboost import XGBClassifier, XGBRegressor
 
 BIRD_MEASURER_ASSESSMENT = 'Bird Measurer (Assessment)'
 INTEGER_PARAMS = ['max_depth', 'max_bin', 'num_leaves',
@@ -49,7 +50,6 @@ def preprocess_events():
 
             correct, uncorrect = game_sessions[idx]['correct_attempts'], game_sessions[idx]['uncorrect_attempts']
             if correct == 0 and uncorrect == 0:
-                # game_sessions[idx]['accuracy_rate'] = 0.0
                 pass
             else:
                 game_sessions[idx]['accuracy_rate'] = correct / float(correct + uncorrect)
@@ -121,15 +121,17 @@ def preprocess_events():
                     is_non_bird_measurer_attempt = row['title'] != BIRD_MEASURER_ASSESSMENT and event_code == 4100
                     is_assessment_attempt = is_bird_measurer_attempt or is_non_bird_measurer_attempt
 
-                    if is_assessment_attempt:
-                        is_correct_attempt = 'correct' in event_data and event_data['correct']
-                        is_uncorrect_attempt = 'correct' in event_data and not event_data['correct']
-
-                        if is_correct_attempt and is_assessment_attempt:
+                    if is_assessment_attempt and 'correct' in event_data:
+                        if event_data['correct']:
                             game_session['correct_attempts'] += 1
-
-                        if is_uncorrect_attempt and is_assessment_attempt:
+                        else:
                             game_session['uncorrect_attempts'] += 1
+
+                if row['type'] == 'Game' and 'correct' in event_data:
+                    if event_data['correct']:
+                        game_session['correct_attempts'] += 1
+                    else:
+                        game_session['uncorrect_attempts'] += 1
 
                 event_id = row['event_id']
                 game_session['event_ids'][f'event_id_{event_id}'] += 1
@@ -138,7 +140,7 @@ def preprocess_events():
                     print(idx)
 
         df_data = pd.DataFrame(_postprocessing(list(game_sessions.values())))
-        fillna0_columns = [column for column in df_data.columns if not column.startswith('accuracy')]
+        fillna0_columns = [column for column in df_data.columns if column not in ['accuracy_group', 'accuracy_rate']]
         df_data[fillna0_columns] = df_data[fillna0_columns].fillna(0.0)
         df_data.to_csv(f'preprocessed-data/{prefix}_game_sessions.csv', index=False)
 
@@ -167,7 +169,7 @@ def preprocess_events():
 
 
 def feature_engineering():
-    aggfns = {'std': np.nanstd, 'mean': np.nanmean, 'max': np.nanmax}
+    aggfns = {'std': np.nanstd, 'mean': np.nanmean, 'sum': np.nansum}
 
     def _add_time_features(df):
         timestamp = pd.to_datetime(df['timestamp'])
@@ -196,7 +198,6 @@ def feature_engineering():
 
         df_assessments = df_assessments.sort_values(by='installation_id')
         installation_id_to_game_sessions = dict(tuple(df_data.groupby('installation_id')))
-        title_to_game_sessions = dict(tuple(df_data.groupby('title')))
 
         _aggregate_game_sessions_columns = (aggregate_game_sessions_columns +
                                             event_codes_columns +
@@ -213,20 +214,6 @@ def feature_engineering():
                 game_sessions_for_installation_id['timestamp'] < start_timestamp
                 ].copy(deep=True)
 
-            game_sessions_for_title = title_to_game_sessions[assessment['title']]
-            previous_global_assesment_game_sessions = game_sessions_for_title[
-                (game_sessions_for_title['timestamp'] < start_timestamp) &
-                (game_sessions_for_title['installation_id'] != installation_id)
-                ][aggregate_assessment_game_session_columns].values
-
-            if previous_global_assesment_game_sessions.shape[0] > 0:
-                previous_global_assesment_game_sessions_agg = _agg_game_sessions(
-                    previous_global_assesment_game_sessions, aggregate_assessment_game_session_columns,
-                    prefix='previous_global_title_attempt_'
-                )
-            else:
-                previous_global_assesment_game_sessions_agg = pd.DataFrame()
-
             assessment_info = pd.DataFrame({
                 'installation_id': installation_id,
                 'assessment_game_session': assessment['game_session'],
@@ -239,22 +226,35 @@ def feature_engineering():
             }, index=[0])
 
             if previous_game_sessions.shape[0] == 0:
-                game_sessions.append(pd.concat((assessment_info, previous_global_assesment_game_sessions_agg), axis=1))
+                game_sessions.append(assessment_info)
                 continue
 
-            # Previous attempts for current assessment
-            # Which attempt, accuracy groups for current assessment, correct/incorrect/rate attempts
-            previous_user_assessment_game_sessions = previous_game_sessions[
+            # Previous user attempts for this assessment
+            previous_user_attempts_at_assessment_game_sessions = previous_game_sessions[
                 previous_game_sessions['title'] == assessment['title']
                 ][aggregate_assessment_game_session_columns].values
 
-            if previous_user_assessment_game_sessions.shape[0] > 0:
-                previous_user_assessment_game_sessions_agg = _agg_game_sessions(
-                    previous_user_assessment_game_sessions, aggregate_assessment_game_session_columns,
-                    prefix='previous_user_title_attempt_'
+            if previous_user_attempts_at_assessment_game_sessions.shape[0] > 0:
+                previous_user_attempts_at_assessment_game_sessions_agg = _agg_game_sessions(
+                    previous_user_attempts_at_assessment_game_sessions, aggregate_assessment_game_session_columns,
+                    prefix='previous_user_attempt_at_assessment_'
                 )
             else:
-                previous_user_assessment_game_sessions_agg = pd.DataFrame()
+                previous_user_attempts_at_assessment_game_sessions_agg = pd.DataFrame()
+
+            # Previous user attempts for games in this world
+            previous_user_attempts_at_world_games = previous_game_sessions[
+                (previous_game_sessions['world'] == assessment['world']) &
+                (previous_game_sessions['type'] == 'Game')
+                ][aggregate_game_game_session_columns].values
+
+            if previous_user_attempts_at_world_games.shape[0] > 0:
+                previous_user_attempts_at_world_games_agg = _agg_game_sessions(
+                    previous_user_attempts_at_world_games, aggregate_game_game_session_columns,
+                    prefix='previous_user_attempts_at_world_games_'
+                )
+            else:
+                previous_user_attempts_at_world_games_agg = pd.DataFrame()
 
             # One-hot-encode categorical features
             previous_game_sessions = pd.get_dummies(
@@ -268,8 +268,13 @@ def feature_engineering():
                 previous_game_sessions_values, _aggregate_game_sessions_columns)
 
             df_final_agg = pd.concat(
-                (assessment_info, previous_game_sessions_agg, ohe_agg, previous_user_assessment_game_sessions_agg,
-                 previous_global_assesment_game_sessions_agg),
+                (
+                    assessment_info,
+                    previous_game_sessions_agg,
+                    ohe_agg,
+                    previous_user_attempts_at_assessment_game_sessions_agg,
+                    previous_user_attempts_at_world_games_agg
+                ),
                 axis=1
             )
 
@@ -281,7 +286,8 @@ def feature_engineering():
             if idx % 100 == 0:
                 print(f'Row {idx + 1}/{total_assessments} done')
 
-        df_final = pd.concat(game_sessions, ignore_index=True, sort=False)
+        df_final = pd.concat(game_sessions, ignore_index=True, sort=False).fillna(0.0)
+        df_final['user_game_time_mean'] = df_final.groupby('installation_id')['game_time_mean'].transform('mean')
         print('Writing features...')
         df_final.to_csv(f'preprocessed-data/{prefix}_features.csv', index=False)
 
@@ -301,6 +307,12 @@ def feature_engineering():
         'accuracy_group_2',
         'accuracy_group_1',
         'accuracy_group_0',
+    ]
+
+    aggregate_game_game_session_columns = aggregate_game_sessions_columns + [
+        'correct_attempts',
+        'uncorrect_attempts',
+        'accuracy_rate',
     ]
 
     df_train_labels = pd.read_csv(TRAIN_LABELS_CSV)
@@ -493,6 +505,8 @@ def get_lgbm_classifier(objective, metric, n_estimators=5000):
             objective=objective,
             metric=metric,
             subsample_freq=1,
+            subsample=1.0,
+            colsample_bytree=1.0,
             **params
         )
 
@@ -508,6 +522,8 @@ def get_lgbm_regressor(objective, metric, n_estimators=5000):
             objective=objective,
             metric=metric,
             subsample_freq=1,
+            subsample=1.0,
+            colsample_bytree=1.0,
             **params
         )
 
@@ -523,6 +539,7 @@ def get_catboost_classifier(objective, metric, cat_features, n_estimators=5000):
             n_estimators=n_estimators,
             cat_features=cat_features,
             use_best_model=True,
+            colsample_bylevel=1.0,
             **params
         )
 
@@ -538,6 +555,45 @@ def get_catboost_regressor(objective, metric, cat_features, n_estimators=5000):
             n_estimators=n_estimators,
             cat_features=cat_features,
             use_best_model=True,
+            colsample_bylevel=1.0,
+            **params
+        )
+
+    return inner
+
+
+def get_elasticnet_regressor():
+    def inner(params):
+        return ElasticNet(
+            random_state=2019,
+            max_iter=10000,
+            selection='random',
+            **params
+        )
+
+    return inner
+
+
+def get_xgboost_classifier(objective, metric, n_estimators=5000):
+    def inner(params):
+        return XGBClassifier(
+            random_state=2019,
+            n_estimators=n_estimators,
+            objective=objective,
+            eval_metric=metric,
+            **params
+        )
+
+    return inner
+
+
+def get_xgboost_regressor(objective, metric, n_estimators=5000):
+    def inner(params):
+        return XGBRegressor(
+            random_state=2019,
+            n_estimators=n_estimators,
+            objective=objective,
+            eval_metric=metric,
             **params
         )
 
@@ -551,7 +607,7 @@ def integer_encode_params(params):
     return params
 
 
-def fit_model(model, X_train, y_train, X_val, y_val, early_stopping_rounds=100, verbose=0):
+def fit_model(model, X_train, y_train, X_val, y_val, early_stopping_rounds=10, verbose=0):
     model.fit(
         X_train, y_train,
         early_stopping_rounds=early_stopping_rounds,
@@ -560,9 +616,15 @@ def fit_model(model, X_train, y_train, X_val, y_val, early_stopping_rounds=100, 
     )
 
 
+def fit_sklearn_model(model, X_train, y_train, X_val, y_val, verbose=0):
+    model.fit(
+        X_train, y_train
+    )
+
+
 def cv_with_oof_predictions(
-        model_fn, score_fn, X, X_test, y, y_accuracy_group, installation_ids, model_params,
-        n_splits=5, n_predicted_features=2, predict_proba=True
+        model_fn, score_fn, fit_fn, X, X_test, y, y_accuracy_group, installation_ids, model_params,
+        n_splits=10, n_predicted_features=2, predict_proba=True, standard_scale=False
 ):
     scores = []
     oof_train_predictions = np.zeros((X.shape[0], n_predicted_features))
@@ -573,8 +635,14 @@ def cv_with_oof_predictions(
         X_train, X_val = X.iloc[train_split, :], X.iloc[test_split, :]
         y_train, y_val = y[train_split], y[test_split]
 
+        if standard_scale:
+            ss = StandardScaler()
+            X_train = ss.fit_transform(X_train)
+            X_val = ss.transform(X_val)
+            X_test = ss.transform(X_test)
+
         model = model_fn(model_params)
-        fit_model(model, X_train, y_train, X_val, y_val)
+        fit_fn(model, X_train, y_train, X_val, y_val)
 
         if predict_proba:
             val_prediction = model.predict_proba(X_val)
@@ -593,7 +661,7 @@ def cv_with_oof_predictions(
     return oof_train_predictions, test_predictions
 
 
-def fit_predict_correct_attempts_model(params):
+def lgb_fit_predict_correct_attempts_model(params):
     features = get_train_test_features()
 
     df_train, df_test = label_encode_categorical_features(features['df_train_features'], features['df_test_features'])
@@ -602,6 +670,7 @@ def fit_predict_correct_attempts_model(params):
     meta_train, meta_test = cv_with_oof_predictions(
         get_lgbm_classifier('binary', 'auc'),
         roc_auc_score,
+        fit_model,
         df_train,
         df_test,
         features['y_correct'],
@@ -613,7 +682,7 @@ def fit_predict_correct_attempts_model(params):
     return meta_train[:, 1].reshape(-1, 1), meta_test[:, 1].reshape(-1, 1)
 
 
-def fit_predict_accuracy_group_regression_model(params):
+def lgb_fit_predict_accuracy_group_regression_model(params):
     features = get_train_test_features()
 
     df_train, df_test = label_encode_categorical_features(features['df_train_features'], features['df_test_features'])
@@ -622,6 +691,7 @@ def fit_predict_accuracy_group_regression_model(params):
     return cv_with_oof_predictions(
         get_lgbm_regressor('regression', 'rmse'),
         lambda y_true, y_pred: math.sqrt(mean_squared_error(y_true, y_pred)),
+        fit_model,
         df_train,
         df_test,
         features['y_accuracy_group'],
@@ -633,7 +703,7 @@ def fit_predict_accuracy_group_regression_model(params):
     )
 
 
-def fit_predict_accuracy_rate_regression_model(params):
+def lgb_fit_predict_accuracy_rate_regression_model(params):
     features = get_train_test_features()
 
     df_train, df_test = label_encode_categorical_features(features['df_train_features'], features['df_test_features'])
@@ -642,6 +712,7 @@ def fit_predict_accuracy_rate_regression_model(params):
     return cv_with_oof_predictions(
         get_lgbm_regressor('regression', 'rmse'),
         lambda y_true, y_pred: math.sqrt(mean_squared_error(y_true, y_pred)),
+        fit_model,
         df_train,
         df_test,
         features['y_accuracy_rate'],
@@ -653,64 +724,179 @@ def fit_predict_accuracy_rate_regression_model(params):
     )
 
 
-def binarize_accuracy_group(y_accuracy_group, target):
-    pos_label_indices = y_accuracy_group > target
-    neg_label_indices = y_accuracy_group <= target
-    y_accuracy_group[pos_label_indices] = 1
-    y_accuracy_group[neg_label_indices] = 0
-    return y_accuracy_group
+def catboost_fit_predict_correct_attempts_model(params):
+    features = get_train_test_features()
+
+    df_train, df_test = label_encode_categorical_features(features['df_train_features'], features['df_test_features'])
+    cat_features = [list(df_train.columns).index(feature) for feature in categorical_features]
+    model_params = integer_encode_params(params)
+
+    meta_train, meta_test = cv_with_oof_predictions(
+        get_catboost_classifier('Logloss', 'AUC', cat_features),
+        roc_auc_score,
+        fit_model,
+        df_train,
+        df_test,
+        features['y_correct'],
+        features['y_accuracy_group'],
+        features['train_installation_ids'],
+        model_params
+    )
+
+    return meta_train[:, 1].reshape(-1, 1), meta_test[:, 1].reshape(-1, 1)
 
 
-def predict_ordinal_accuracy_group(train_predictions, test_predictions):
-    n_train = train_predictions[0].shape[0]
-    n_test = test_predictions[0].shape[0]
-    train_accuracy_group_proba = np.zeros((n_train, 4))
-    test_accuracy_group_proba = np.zeros((n_test, 4))
+def catboost_fit_predict_accuracy_group_regression_model(params):
+    features = get_train_test_features()
 
-    train_accuracy_group_proba[:, 0] = np.ones(n_train) - train_predictions[0]
-    train_accuracy_group_proba[:, 1] = train_predictions[0] - train_predictions[1]
-    train_accuracy_group_proba[:, 2] = train_predictions[1] - train_predictions[2]
-    train_accuracy_group_proba[:, 3] = train_predictions[2]
+    df_train, df_test = label_encode_categorical_features(features['df_train_features'], features['df_test_features'])
+    cat_features = [list(df_train.columns).index(feature) for feature in categorical_features]
+    model_params = integer_encode_params(params)
 
-    test_accuracy_group_proba[:, 0] = np.ones(n_test) - test_predictions[0]
-    test_accuracy_group_proba[:, 1] = test_predictions[0] - test_predictions[1]
-    test_accuracy_group_proba[:, 2] = test_predictions[1] - test_predictions[2]
-    test_accuracy_group_proba[:, 3] = test_predictions[2]
-
-    return (train_accuracy_group_proba.argmax(axis=1).reshape(-1, 1),
-            test_accuracy_group_proba.argmax(axis=1).reshape(-1, 1))
-
-
-def fit_predict_ordinal_model(params):
-    train_predictions = []
-    test_predictions = []
-    for target in [0, 1, 2]:
-        features = get_train_test_features()
-
-        y_accuracy_group = binarize_accuracy_group(features['y_accuracy_group'], target)
-
-        df_train, df_test = label_encode_categorical_features(features['df_train_features'],
-                                                              features['df_test_features'])
-        model_params = integer_encode_params(params[target])
-
-        train_prediction, test_prediction = cv_with_oof_predictions(
-            get_lgbm_classifier('binary', 'auc'),
-            roc_auc_score,
-            df_train,
-            df_test,
-            y_accuracy_group,
-            y_accuracy_group,
-            features['train_installation_ids'],
-            model_params,
-        )
-
-        train_predictions.append(train_prediction[:, 1])
-        test_predictions.append(test_prediction[:, 1])
-
-    return predict_ordinal_accuracy_group(train_predictions, test_predictions)
+    return cv_with_oof_predictions(
+        get_catboost_regressor('RMSE', 'RMSE', cat_features),
+        lambda y_true, y_pred: math.sqrt(mean_squared_error(y_true, y_pred)),
+        fit_model,
+        df_train,
+        df_test,
+        features['y_accuracy_group'],
+        features['y_accuracy_group'],
+        features['train_installation_ids'],
+        model_params,
+        predict_proba=False,
+        n_predicted_features=1
+    )
 
 
-class OptimizedRounder(object):
+def catboost_fit_predict_accuracy_rate_regression_model(params):
+    features = get_train_test_features()
+
+    df_train, df_test = label_encode_categorical_features(features['df_train_features'], features['df_test_features'])
+    cat_features = [list(df_train.columns).index(feature) for feature in categorical_features]
+    model_params = integer_encode_params(params)
+
+    return cv_with_oof_predictions(
+        get_catboost_regressor('RMSE', 'RMSE', cat_features),
+        lambda y_true, y_pred: math.sqrt(mean_squared_error(y_true, y_pred)),
+        fit_model,
+        df_train,
+        df_test,
+        features['y_accuracy_rate'],
+        features['y_accuracy_group'],
+        features['train_installation_ids'],
+        model_params,
+        predict_proba=False,
+        n_predicted_features=1
+    )
+
+
+def elasticnet_fit_predict_accuracy_group_regression_model(params):
+    features = get_train_test_features()
+
+    df_train, df_test = ohe_encode_categorical_features(features['df_train_features'], features['df_test_features'])
+    model_params = integer_encode_params(params)
+
+    return cv_with_oof_predictions(
+        get_elasticnet_regressor(),
+        lambda y_true, y_pred: math.sqrt(mean_squared_error(y_true, y_pred)),
+        fit_sklearn_model,
+        df_train,
+        df_test,
+        features['y_accuracy_group'],
+        features['y_accuracy_group'],
+        features['train_installation_ids'],
+        model_params,
+        predict_proba=False,
+        n_predicted_features=1,
+        standard_scale=True
+    )
+
+
+def elasticnet_fit_predict_accuracy_rate_regression_model(params):
+    features = get_train_test_features()
+
+    df_train, df_test = label_encode_categorical_features(features['df_train_features'], features['df_test_features'])
+    model_params = integer_encode_params(params)
+
+    return cv_with_oof_predictions(
+        get_elasticnet_regressor(),
+        lambda y_true, y_pred: math.sqrt(mean_squared_error(y_true, y_pred)),
+        fit_sklearn_model,
+        df_train,
+        df_test,
+        features['y_accuracy_rate'],
+        features['y_accuracy_group'],
+        features['train_installation_ids'],
+        model_params,
+        predict_proba=False,
+        n_predicted_features=1
+    )
+
+
+def xgboost_fit_predict_correct_attempts_model(params):
+    features = get_train_test_features()
+
+    df_train, df_test = ohe_encode_categorical_features(features['df_train_features'], features['df_test_features'])
+    model_params = integer_encode_params(params)
+
+    meta_train, meta_test = cv_with_oof_predictions(
+        get_xgboost_classifier('binary:logistic', 'auc'),
+        roc_auc_score,
+        fit_model,
+        df_train,
+        df_test,
+        features['y_correct'],
+        features['y_accuracy_group'],
+        features['train_installation_ids'],
+        model_params
+    )
+
+    return meta_train[:, 1].reshape(-1, 1), meta_test[:, 1].reshape(-1, 1)
+
+
+def xgboost_fit_predict_accuracy_group_regression_model(params):
+    features = get_train_test_features()
+
+    df_train, df_test = ohe_encode_categorical_features(features['df_train_features'], features['df_test_features'])
+    model_params = integer_encode_params(params)
+
+    return cv_with_oof_predictions(
+        get_xgboost_regressor('reg:squarederror', 'rmse'),
+        lambda y_true, y_pred: math.sqrt(mean_squared_error(y_true, y_pred)),
+        fit_model,
+        df_train,
+        df_test,
+        features['y_accuracy_group'],
+        features['y_accuracy_group'],
+        features['train_installation_ids'],
+        model_params,
+        predict_proba=False,
+        n_predicted_features=1
+    )
+
+
+def xgboost_fit_predict_accuracy_rate_regression_model(params):
+    features = get_train_test_features()
+
+    df_train, df_test = ohe_encode_categorical_features(features['df_train_features'], features['df_test_features'])
+    model_params = integer_encode_params(params)
+
+    return cv_with_oof_predictions(
+        get_xgboost_regressor('reg:squarederror', 'rmse'),
+        lambda y_true, y_pred: math.sqrt(mean_squared_error(y_true, y_pred)),
+        fit_model,
+        df_train,
+        df_test,
+        features['y_accuracy_rate'],
+        features['y_accuracy_group'],
+        features['train_installation_ids'],
+        model_params,
+        predict_proba=False,
+        n_predicted_features=1
+    )
+
+
+class OptimizedRounder:
     def __init__(self, initial_coef, labels):
         self.coef_ = 0
         self.initial_coef = initial_coef
@@ -733,100 +919,118 @@ class OptimizedRounder(object):
 
 
 def output_submission():
-    models = [
+    lgb_models = [
         {
-            'name': 'correct_attempts',
-            # 'thresholds': [0.4, 0.8, 0.95],
-            'thresholds': [lambda: np.random.uniform(0.3, 0.5), lambda: np.random.uniform(0.5, 0.85), lambda: np.random.uniform(0.85, 0.95)],
-            'params': {'colsample_bytree': 0.7119967076685797,
-                       'learning_rate': 0.3898073223635955,
-                       'max_bin': 490.7257788082861,
-                       'max_depth': 6.393385888236407,
-                       'min_child_samples': 618.8943108109222,
-                       'min_child_weight': 242.39854189044027,
-                       'num_leaves': 226.53292461740185,
-                       'reg_alpha': 29.112808215086247,
-                       'reg_lambda': 1.442864888247586,
-                       'subsample': 0.9508616840652329}
+            'name': 'lgb_correct_attempts',
+            'fit_predict_fn': lgb_fit_predict_correct_attempts_model,
+            'thresholds': [(0.3, 0.5), (0.5, 0.85), (0.85, 0.95)],
+            'params': {'learning_rate': 0.48167614730562847,
+                       'max_bin': 419.5794922742474,
+                       'max_depth': 13.998338323966081,
+                       'min_child_samples': 599.3629839842425,
+                       'min_child_weight': 250.25027513465395,
+                       'num_leaves': 6.802197073843434,
+                       'reg_alpha': 3.678603438728225,
+                       'reg_lambda': 1.0191385015353065}
         },
         {
-            'name': 'accuracy_group_regression',
-            # 'thresholds': [0.5, 1.5, 2.5],
-            'thresholds': [lambda: np.random.uniform(0, 1), lambda: np.random.uniform(1, 2), lambda: np.random.uniform(2, 3)],
-            'params': {'colsample_bytree': 0.10220450673829048,
-                       'learning_rate': 0.018036788162107645,
-                       'max_bin': 495.15682953018984,
-                       'max_depth': 12.957323504526952,
-                       'min_child_samples': 55.28291794257959,
-                       'min_child_weight': 484.471987537883,
-                       'num_leaves': 487.9146357293617,
-                       'reg_alpha': 12.208540618209394,
-                       'reg_lambda': 14.820117618503028,
-                       'subsample': 0.9553498912171228}
+            'name': 'lgb_accuracy_group_regression',
+            'fit_predict_fn': lgb_fit_predict_accuracy_group_regression_model,
+            'thresholds': [(0, 1), (1, 2), (2, 3)],
+            'params': {'learning_rate': 0.05212540561823331,
+                       'max_bin': 204.7112162055064,
+                       'max_depth': 12.01521111509996,
+                       'min_child_samples': 50.62820932872383,
+                       'min_child_weight': 523.3866794090738,
+                       'num_leaves': 309.03594226296747,
+                       'reg_alpha': 1.64211663480082,
+                       'reg_lambda': 27.791046379299146}
         },
         {
-            'name': 'accuracy_rate_regression',
-            # 'thresholds': [0.25, 0.5, 0.75],
-            'thresholds': [lambda: np.random.uniform(0.1, 0.3), lambda: np.random.uniform(0.4, 0.6), lambda: np.random.uniform(0.7, 0.9)],
-            'params': {'colsample_bytree': 0.3219064135017099,
-                       'learning_rate': 0.012346429656658994,
-                       'max_bin': 13.58960894887651,
-                       'max_depth': 3.9084457978764915,
-                       'min_child_samples': 578.9230545329486,
-                       'min_child_weight': 254.75521773098373,
-                       'num_leaves': 208.59965593534642,
-                       'reg_alpha': 20.973836559719214,
-                       'reg_lambda': 28.4873802178074,
-                       'subsample': 0.8351287838482833}
-        },
-        {
-            'name': 'accuracy_group_ordinal',
-            'params': [
-                {'colsample_bytree': 0.39370372351569727,
-                 'learning_rate': 0.2977323934075598,
-                 'max_bin': 489.4294536649877,
-                 'max_depth': 8.739684209308205,
-                 'min_child_samples': 454.3209316311202,
-                 'min_child_weight': 18.192270605066476,
-                 'num_leaves': 494.896099744235,
-                 'reg_alpha': 28.465109515910957,
-                 'reg_lambda': 29.8788782909773,
-                 'subsample': 0.8020994065767717},
-                {'colsample_bytree': 0.8743807726819987,
-                 'learning_rate': 0.0503587517143143,
-                 'max_bin': 89.2179685244991,
-                 'max_depth': 14.4251619048779,
-                 'min_child_samples': 226.81637132874744,
-                 'min_child_weight': 118.02167568264719,
-                 'num_leaves': 10.419557797232418,
-                 'reg_alpha': 3.4139768591952686,
-                 'reg_lambda': 28.977438242669628,
-                 'subsample': 0.7572929646845502},
-                {'colsample_bytree': 0.711800015732685,
-                 'learning_rate': 0.22948791016816208,
-                 'max_bin': 113.43166482130843,
-                 'max_depth': 15.83595141260532,
-                 'min_child_samples': 859.5779870826568,
-                 'min_child_weight': 598.4798664200113,
-                 'num_leaves': 253.4183460048864,
-                 'reg_alpha': 3.9659199358286896,
-                 'reg_lambda': 29.771125171182824,
-                 'subsample': 0.9999786229569586}
-            ]
+            'name': 'lgb_accuracy_rate_regression',
+            'fit_predict_fn': lgb_fit_predict_accuracy_rate_regression_model,
+            'thresholds': [(0.1, 0.3), (0.4, 0.6), (0.7, 0.9)],
+            'params': {'learning_rate': 0.016286068132386897,
+                       'max_bin': 123.22441899808396,
+                       'max_depth': 11.433462193261546,
+                       'min_child_samples': 377.7231525336464,
+                       'min_child_weight': 284.94771870804243,
+                       'num_leaves': 16.060258947743566,
+                       'reg_alpha': 1.945045074540653,
+                       'reg_lambda': 27.18254007683529}
         },
     ]
 
+    catboost_models = [
+        {
+            'name': 'catboost_correct_attempts',
+            'fit_predict_fn': catboost_fit_predict_correct_attempts_model,
+            'thresholds': [(0.3, 0.5), (0.5, 0.85), (0.85, 0.95)],
+            'params': {'l2_leaf_reg': 1.070238795631429,
+                       'learning_rate': 0.10077590426786258,
+                       'max_depth': 4.9100843756637875}
+        },
+        {
+            'name': 'catboost_accuracy_group_regression',
+            'fit_predict_fn': catboost_fit_predict_accuracy_group_regression_model,
+            'thresholds': [(0, 1), (1, 2), (2, 3)],
+            'params': {'l2_leaf_reg': 4.932974091609228,
+                       'learning_rate': 0.10142152091274366,
+                       'max_depth': 5.564929440504873}
+        },
+        {
+            'name': 'catboost_accuracy_rate_regression',
+            'fit_predict_fn': catboost_fit_predict_accuracy_rate_regression_model,
+            'thresholds': [(0.1, 0.3), (0.4, 0.6), (0.7, 0.9)],
+            'params': {'l2_leaf_reg': 23.11192947324505,
+                       'learning_rate': 0.1012324928519919,
+                       'max_depth': 7.216560644143432}
+        },
+    ]
+
+    xgboost_models = [
+        {
+            'name': 'xgboost_correct_attempts',
+            'fit_predict_fn': xgboost_fit_predict_correct_attempts_model,
+            'thresholds': [(0.3, 0.5), (0.5, 0.85), (0.85, 0.95)],
+            'params': {'learning_rate': 0.42355675717639446,
+                       'max_bin': 201.60605657684866,
+                       'max_depth': 7.253975720615041,
+                       'min_child_samples': 1241.614766407504,
+                       'min_child_weight': 213.82939964039417,
+                       'reg_alpha': 1.9706368862497017,
+                       'reg_lambda': 14.590840603304597}
+        },
+        {
+            'name': 'xgboost_accuracy_group_regression',
+            'fit_predict_fn': xgboost_fit_predict_accuracy_group_regression_model,
+            'thresholds': [(0, 1), (1, 2), (2, 3)],
+            'params': {'learning_rate': 0.12759819624111682,
+                       'max_bin': 372.75756638231735,
+                       'max_depth': 6.966748383686637,
+                       'min_child_samples': 275.205166701255,
+                       'min_child_weight': 277.6947060814316,
+                       'reg_alpha': 10.858373818774762,
+                       'reg_lambda': 4.573895049487007}
+        },
+        {
+            'name': 'xgboost_accuracy_rate_regression',
+            'fit_predict_fn': xgboost_fit_predict_accuracy_rate_regression_model,
+            'thresholds': [(0.1, 0.3), (0.4, 0.6), (0.7, 0.9)],
+            'params': {'learning_rate': 0.2704548231125633,
+                       'max_bin': 151.72548066572423,
+                       'max_depth': 6.571678634234293,
+                       'min_child_samples': 1148.0189646018578,
+                       'min_child_weight': 45.53782541558896,
+                       'reg_alpha': 25.432340908016528,
+                       'reg_lambda': 1.7609398148851962}
+        },
+    ]
+
+    models = xgboost_models + lgb_models + catboost_models
+
     def output_meta_features():
-        base_features = []
-        for model_desc in models:
-            if model_desc['name'] == 'correct_attempts':
-                base_features.append(fit_predict_correct_attempts_model(model_desc['params']))
-            elif model_desc['name'] == 'accuracy_group_regression':
-                base_features.append(fit_predict_accuracy_group_regression_model(model_desc['params']))
-            elif model_desc['name'] == 'accuracy_rate_regression':
-                base_features.append(fit_predict_accuracy_rate_regression_model(model_desc['params']))
-            elif model_desc['name'] == 'accuracy_group_ordinal':
-                base_features.append(fit_predict_ordinal_model(model_desc['params']))
+        base_features = [model_desc['fit_predict_fn'](model_desc['params']) for model_desc in models]
 
         meta_train_features = np.concatenate([_train for (_train, _) in base_features], axis=1)
         meta_test_features = np.concatenate([_test for (_, _test) in base_features], axis=1)
@@ -847,81 +1051,65 @@ def output_submission():
         df_meta_train.to_csv('preprocessed-data/meta_train_features.csv', index=False)
         df_meta_test.to_csv('preprocessed-data/meta_test_features.csv', index=False)
 
-    def output_test_predictions():
+    def find_best_thresholds(model_desc, feature, target):
+        print('Thresholding: ', model_desc['name'])
+        best_or = None
+        best_score = 0.0
+
+        for _ in range(30):
+            thresholds = [np.random.uniform(*init_thresholds) for init_thresholds in model_desc['thresholds']]
+            or_ = OptimizedRounder(thresholds, [0, 1, 2, 3])
+            or_.fit(feature, target)
+
+            prediction = or_.predict(feature, or_.coefficients())
+            score = cohen_kappa_score(prediction, target, weights='quadratic')
+
+            if score > best_score:
+                best_score = score
+                best_or = or_
+                print('New best score: ', score)
+
+        print('Best score: ', best_score)
+        return best_or
+
+    def output_thresholded_predictions():
         df_meta_test_features = pd.read_csv('preprocessed-data/meta_test_features.csv')
         df_meta_train_features = pd.read_csv('preprocessed-data/meta_train_features.csv')
         target = df_meta_train_features['target'].values
         test_installation_ids = df_meta_test_features['installation_ids']
 
-        best_score = 0.0
-        best_test_prediction = None
+        meta_train_thresholded = {}
+        meta_test_thresholded = {}
 
-        for _ in range(100):
-            train_scores = {}
-            meta_train_thresholded = {}
-            meta_test_thresholded = {}
+        for model_desc in models:
+            train_feature = df_meta_train_features[model_desc['name']]
+            or_ = find_best_thresholds(model_desc, train_feature, target)
 
-            for model_desc in models:
-                if 'thresholds' in model_desc:
-                    thresholds = [rand_fn() for rand_fn in model_desc['thresholds']]
-                    or_ = OptimizedRounder(thresholds, [0, 1, 2, 3])
-                    or_.fit(df_meta_train_features[model_desc['name']], target)
+            train_prediction = or_.predict(train_feature, or_.coefficients())
+            test_prediction = or_.predict(df_meta_test_features[model_desc['name']], or_.coefficients())
 
-                    train_prediction = or_.predict(df_meta_train_features[model_desc['name']], or_.coefficients())
-                    test_prediction = or_.predict(df_meta_test_features[model_desc['name']], or_.coefficients())
+            meta_train_thresholded[model_desc['name']] = train_prediction.values
+            meta_test_thresholded[model_desc['name']] = test_prediction.values
 
-                    train_score = cohen_kappa_score(train_prediction, target, weights='quadratic')
-                    print(
-                        model_desc['name'],
-                        or_.coefficients(),
-                        train_score
-                    )
+        train_prediction_mean = pd.DataFrame(meta_train_thresholded).values.mean(axis=1)
+        test_prediction_mean = pd.DataFrame(meta_test_thresholded).values.mean(axis=1)
 
-                    meta_train_thresholded[model_desc['name']] = train_prediction.values
-                    meta_test_thresholded[model_desc['name']] = test_prediction.values
-                else:
-                    meta_train_thresholded[model_desc['name']] = df_meta_train_features[
-                        model_desc['name']].values.astype(int)
-                    meta_test_thresholded[model_desc['name']] = df_meta_test_features[model_desc['name']].values.astype(int)
+        or_ = find_best_thresholds(
+            {'name': 'Final', 'thresholds': [(0, 1), (1, 2), (2, 3)]}, train_prediction_mean, target)
 
-                    train_score = cohen_kappa_score(meta_train_thresholded[model_desc['name']], target, weights='quadratic')
-                    print(
-                        model_desc['name'],
-                        train_score
-                    )
+        train_prediction = or_.predict(train_prediction_mean, or_.coefficients())
+        test_prediction = or_.predict(test_prediction_mean, or_.coefficients())
 
-                train_scores[model_desc['name']] = train_score
-
-            df_train_prediction = pd.DataFrame(meta_train_thresholded)
-            df_test_prediction = pd.DataFrame(meta_test_thresholded)[df_train_prediction.columns]
-
-            train_weights = [train_scores[column] for column in df_train_prediction.columns]
-            train_weights = np.array(train_weights) / np.sum(train_weights)
-
-            train_prediction = []
-            for _, row in df_train_prediction.iterrows():
-                pred = np.bincount(row.values.astype(int), minlength=4, weights=train_weights).argmax()
-                train_prediction.append(pred)
-
-            test_prediction = []
-            for _, row in df_test_prediction.iterrows():
-                pred = np.bincount(row.values.astype(int), minlength=4, weights=train_weights).argmax()
-                test_prediction.append(pred)
-
-            score = cohen_kappa_score(train_prediction, target, weights='quadratic')
-            print(score)
-
-            if score > best_score:
-                best_score = score
-                best_test_prediction = test_prediction
+        score = cohen_kappa_score(train_prediction, target, weights='quadratic')
+        print('Train score: ', score)
 
         pd.DataFrame.from_dict({
             'installation_id': test_installation_ids,
-            'accuracy_group': best_test_prediction
+            'accuracy_group': test_prediction
         }).to_csv('submission.csv', index=False)
 
     output_meta_features()
-    output_test_predictions()
+    output_thresholded_predictions()
 
 
 categorical_features = [
